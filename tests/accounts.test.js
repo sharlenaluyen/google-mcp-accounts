@@ -66,6 +66,6 @@ test("createAuthClient builds a refreshing client from the stored token", () => 
 test("createAuthClient refuses up front when a needed scope wasn't granted, naming the fix", () => {
   assert.throws(
     () => createAuthClient("main", { OAuth2: FakeOAuth2, requiredScopes: PRODUCT_SCOPES.drive }),
-    /hasn't granted drive\.file\. Re-authorize it once with: npx google-mcp-auth main/
+    /hasn't granted drive\.file\. Re-authorize it once with: node auth\.js main/
   );
 });

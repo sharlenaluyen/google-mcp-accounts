@@ -44,7 +44,7 @@ export function createAuthClient(name, { OAuth2, requiredScopes = [] }) {
   if (missing.length) {
     throw new Error(
       `Account "${info.alias}" (${info.email}) hasn't granted ${missing.map(shortScope).join(", ")}. ` +
-        `Re-authorize it once with: npx google-mcp-auth ${info.alias}  (run inside the google-mcp-accounts folder)`
+        `Re-authorize it once with: node auth.js ${info.alias}  (in the google-mcp-accounts folder)`
     );
   }
   const { clientId, clientSecret, redirectUri } = loadCredentials();
