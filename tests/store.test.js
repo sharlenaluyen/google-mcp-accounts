@@ -230,13 +230,6 @@ test("a fresh lock held by a live process makes writes wait until it's released"
   assert.equal(store.loadAccounts().main.after_live_lock, "ok");
 });
 
-test("importAccounts goes through the lock and refuses to overwrite an existing accounts.json", async () => {
-  const before = fs.readFileSync(store.ACCOUNTS_PATH, "utf8");
-  await assert.rejects(store.importAccounts({ x: { email: "x@x.com" } }), /already exists/);
-  assert.equal(fs.readFileSync(store.ACCOUNTS_PATH, "utf8"), before);
-  assert.ok(!fs.existsSync(store.LOCK_PATH)); // released after the refusal
-});
-
 test("saveAccounts isn't exported, so nothing can write accounts.json without the lock", () => {
   assert.equal(store.saveAccounts, undefined);
 });

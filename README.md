@@ -91,16 +91,6 @@ Install this package **before** `npm install` in any of the four servers.
 They depend on it as `"google-mcp-accounts": "file:../google-mcp-accounts"`,
 and its own dependencies have to be present for them to load it.
 
-### Coming from multi-gmail-mcp's old `~/.multi-gmail-mcp/`
-
-```bash
-node auth.js --import-legacy          # copies accounts.json + credentials.json, never overwrites
-node auth.js --list                   # imported accounts show "granted: gmail"
-node auth.js work                     # re-authorize each one to add Calendar/Drive/Docs/Sheets/Slides
-```
-
-The old folder is left untouched. Delete it yourself once everything works.
-
 ## Connect to Claude
 
 This package isn't an MCP server itself, so it gets no entry in Claude's
@@ -108,14 +98,11 @@ config. The four servers do. Do these steps in this order, so Claude never
 starts a server that can't load its accounts:
 
 1. **Install this package**: `cd google-mcp-accounts && npm install`.
-2. **Get your accounts into `~/.google-mcp/`**. Either import from the old
-   Gmail folder with `node auth.js --import-legacy`, or connect fresh with
-   `node auth.js <alias>`. Either way, re-run `node auth.js <alias>` once per
-   account so it grants Calendar, Drive, Docs, Sheets, and Slides, then
-   check with `node auth.js --list`.
+2. **Connect your accounts** with `node auth.js <alias>`, once per Google
+   account, then check with `node auth.js --list`. Each one should show
+   Gmail, Calendar, Drive, Docs, Sheets, and Slides as granted.
 3. **Update multi-gmail-mcp** to the version that uses this package, and
-   run `npm install` there. Until step 2 is done, that version finds no
-   accounts.
+   run `npm install` there. It finds no accounts until step 2 is done.
 4. **Install the other three servers**: `npm install` in multi-gcal-mcp,
    multi-gdrive-mcp, and gworkspace-docs-sheets-slides-mcp.
 5. **Add the servers to Claude.** For Claude Desktop on macOS, edit
@@ -161,7 +148,6 @@ node auth.js --list                         accounts, nicknames, and what each o
 node auth.js --remove <alias>               disconnect (local token only)
 node auth.js --nick <alias> <nickname>      another name for the same account
 node auth.js --unnick <nickname>            remove a nickname
-node auth.js --import-legacy [dir]          one-time import from ~/.multi-gmail-mcp
 ```
 
 **Re-running `node auth.js <alias>` re-authorizes and overwrites that alias's

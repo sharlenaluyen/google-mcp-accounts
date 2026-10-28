@@ -25,7 +25,7 @@ await store.upsertAccount("other", {
   refresh_token: "rt2",
   scopes: PRODUCT_SCOPES.gmail,
 });
-await store.upsertAccount("legacy", { email: "old@x.com", refresh_token: "rt3" }); // no scopes recorded
+await store.upsertAccount("noscopes", { email: "old@x.com", refresh_token: "rt3" }); // e.g. hand-edited
 
 // Stands in for google.auth.OAuth2 so the test makes no network calls.
 class FakeOAuth2 {
@@ -47,13 +47,16 @@ test("getAccountInfo resolves nicknames and getConnectedAliases lists each accou
   assert.throws(() => getAccountInfo("nope"), /Connected aliases: .*other/);
 });
 
-test("missingScopes lists what an account never granted; unknown scopes pass", () => {
+test("missingScopes lists what an account never granted; no recorded scopes means none granted", () => {
   const info = getAccountInfo("main");
   assert.deepEqual(missingScopes(info, PRODUCT_SCOPES.gmail), []);
   assert.deepEqual(missingScopes(info, PRODUCT_SCOPES.calendar), PRODUCT_SCOPES.calendar);
-  assert.deepEqual(missingScopes(getAccountInfo("legacy"), PRODUCT_SCOPES.calendar), []);
+  assert.deepEqual(
+    missingScopes(getAccountInfo("noscopes"), PRODUCT_SCOPES.calendar),
+    PRODUCT_SCOPES.calendar
+  );
   assert.ok(hasScope(info, PRODUCT_SCOPES.gmail[0]));
-  assert.ok(!hasScope(getAccountInfo("legacy"), PRODUCT_SCOPES.gmail[0]));
+  assert.ok(!hasScope(getAccountInfo("noscopes"), PRODUCT_SCOPES.gmail[0]));
 });
 
 test("createAuthClient builds a refreshing client from the stored token", () => {

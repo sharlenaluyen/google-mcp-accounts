@@ -9,25 +9,18 @@
 //   node auth.js --remove <alias>              -> disconnect an account
 //   node auth.js --nick <alias> <nickname>     -> add another name for an account
 //   node auth.js --unnick <nickname>           -> remove a nickname
-//   node auth.js --import-legacy [dir]         -> one-time copy of accounts from ~/.multi-gmail-mcp
 
 import crypto from "crypto";
-import fs from "fs";
 import http from "http";
-import os from "os";
-import path from "path";
 import { URL } from "url";
 import { OAuth2Client } from "google-auth-library";
 import open from "open";
 import {
   CONFIG_DIR,
   ACCOUNTS_PATH,
-  CREDENTIALS_PATH,
-  ensureConfigDir,
   loadCredentials,
   upsertAccount,
   loadAccounts,
-  importAccounts,
   removeAccount,
   addNickname,
   removeNickname,
@@ -35,10 +28,6 @@ import {
 import { REQUIRED_SCOPES, DRIVE_READONLY_SCOPE, scopesToRequest, shortScope } from "./scopes.js";
 
 const NAME_PATTERN = /^[a-z0-9_-]+$/i;
-const LEGACY_DIR = path.join(os.homedir(), ".multi-gmail-mcp");
-// What the old multi-gmail-mcp auth script requested; recorded on imported
-// entries so servers can tell those accounts still need re-authorizing.
-const LEGACY_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"];
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -46,7 +35,6 @@ function parseArgs() {
   if (args[0] === "--remove") return { cmd: "remove", alias: args[1] };
   if (args[0] === "--nick") return { cmd: "nick", alias: args[1], nickname: args[2] };
   if (args[0] === "--unnick") return { cmd: "unnick", nickname: args[1] };
-  if (args[0] === "--import-legacy") return { cmd: "import-legacy", dir: args[1] };
   if (args[0] && !args[0].startsWith("--")) {
     return { cmd: "connect", alias: args[0], driveReadonly: args.includes("--with-drive-readonly") };
   }
@@ -238,36 +226,6 @@ async function unnick(nickname) {
   console.log(`Removed nickname "${nickname}" from account "${owner}".`);
 }
 
-// One-time move from multi-gmail-mcp's old ~/.multi-gmail-mcp folder. Copies,
-// never moves or deletes, and refuses to overwrite anything already here.
-async function importLegacy(dir) {
-  const fromDir = path.resolve(dir || LEGACY_DIR);
-  const legacyAccounts = path.join(fromDir, "accounts.json");
-  const legacyCredentials = path.join(fromDir, "credentials.json");
-  if (fs.existsSync(ACCOUNTS_PATH)) {
-    fail(new Error(`${ACCOUNTS_PATH} already exists - not importing over it.`));
-  }
-  if (!fs.existsSync(legacyAccounts)) fail(new Error(`Nothing to import: ${legacyAccounts} not found.`));
-
-  ensureConfigDir();
-  if (!fs.existsSync(CREDENTIALS_PATH) && fs.existsSync(legacyCredentials)) {
-    fs.copyFileSync(legacyCredentials, CREDENTIALS_PATH, fs.constants.COPYFILE_EXCL);
-    fs.chmodSync(CREDENTIALS_PATH, 0o600);
-    console.log(`Copied OAuth client: ${legacyCredentials} -> ${CREDENTIALS_PATH}`);
-  }
-
-  const accounts = JSON.parse(fs.readFileSync(legacyAccounts, "utf8"));
-  for (const alias of Object.keys(accounts)) {
-    if (!Array.isArray(accounts[alias].scopes)) accounts[alias].scopes = LEGACY_SCOPES;
-  }
-  await importAccounts(accounts).catch(fail);
-  console.log(`Imported ${Object.keys(accounts).length} account(s) into ${ACCOUNTS_PATH}.`);
-  console.log(
-    `They still only have Gmail access. Re-run "node auth.js <alias>" for each one to grant Calendar, Drive, Docs, Sheets and Slides.`
-  );
-  console.log(`${fromDir} was left as-is; delete it yourself once everything works.`);
-}
-
 function help() {
   console.log(`
 Google MCP accounts - one login per Google account, shared by every Google MCP server
@@ -283,9 +241,6 @@ Google MCP accounts - one login per Google account, shared by every Google MCP s
   node auth.js --nick <alias> <nickname>
                                     add another name for an already-connected account
   node auth.js --unnick <nickname>  remove a nickname (the account stays connected)
-  node auth.js --import-legacy [dir]
-                                    one-time copy of accounts and the OAuth client from
-                                    multi-gmail-mcp's old folder (default ~/.multi-gmail-mcp)
 
 Example:
   node auth.js personal
@@ -294,11 +249,10 @@ Example:
 `);
 }
 
-const { cmd, alias, nickname, driveReadonly, dir } = parseArgs();
+const { cmd, alias, nickname, driveReadonly } = parseArgs();
 if (cmd === "connect") await connect(alias, driveReadonly);
 else if (cmd === "list") await list();
 else if (cmd === "remove") await remove(alias);
 else if (cmd === "nick") await nick(alias, nickname);
 else if (cmd === "unnick") await unnick(nickname);
-else if (cmd === "import-legacy") await importLegacy(dir);
 else help();

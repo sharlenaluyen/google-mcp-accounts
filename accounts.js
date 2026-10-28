@@ -22,12 +22,12 @@ export function getAccountInfo(name) {
   return { alias, nicknames: [], ...accounts[alias] };
 }
 
-// The scopes in `required` this account never granted. An entry with no
-// recorded `scopes` (written by an older auth CLI) is treated as unknown and
-// passes - Google's own 403 is then the fallback.
+// The scopes in `required` this account never granted. auth.js records the
+// granted scopes on every connect, so an entry without them is treated as
+// having granted nothing (re-running auth fixes it).
 export function missingScopes(info, required) {
-  if (!Array.isArray(info.scopes)) return [];
-  return required.filter((scope) => !info.scopes.includes(scope));
+  const granted = Array.isArray(info.scopes) ? info.scopes : [];
+  return required.filter((scope) => !granted.includes(scope));
 }
 
 export function hasScope(info, scope) {

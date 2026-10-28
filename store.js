@@ -282,16 +282,3 @@ export function removeAccount(alias) {
     saveAccounts(accounts);
   });
 }
-
-// One-time import of a whole accounts file (auth.js --import-legacy). Runs
-// under the same lock as every other write, and refuses if accounts.json
-// already exists - checked while holding the lock, so a concurrent
-// "node auth.js <alias>" can't be overwritten.
-export function importAccounts(accounts) {
-  return serialized(() => {
-    if (fs.existsSync(ACCOUNTS_PATH)) {
-      throw new Error(`${ACCOUNTS_PATH} already exists - not importing over it.`);
-    }
-    saveAccounts(accounts);
-  });
-}
