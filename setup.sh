@@ -3,6 +3,10 @@
 # client, cloning the repos, connecting accounts, and wiring it all into
 # Claude Desktop. macOS only.
 #
+# Safe to re-run: existing projects, clones, credentials, accounts and Claude
+# config entries are reused or merged, never thrown away. Anything it replaces
+# is backed up first.
+#
 # Run from a clone:   ./setup.sh
 # Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup.sh)
 
@@ -14,13 +18,23 @@ APIS=(gmail.googleapis.com calendar-json.googleapis.com drive.googleapis.com doc
 
 GOOGLE_MCP_DIR="${GOOGLE_MCP_DIR:-$HOME/.google-mcp}"
 CREDENTIALS_PATH="$GOOGLE_MCP_DIR/credentials.json"
+ACCOUNTS_PATH="$GOOGLE_MCP_DIR/accounts.json"
 CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 NAME_PATTERN='^[A-Za-z0-9_-]+$'
 
+# Projects this script creates carry this label, so a re-run finds and reuses
+# the project instead of making another one.
+PROJECT_LABEL_KEY="created-by"
+PROJECT_LABEL_VALUE="google-mcp-setup"
+GCLOUD_SDK_DIR="$HOME/google-cloud-sdk"
+
+GCLOUD=""
+GCLOUD_ACCOUNT=""
 PROJECT_ID=""
-USE_GCLOUD=0
+HAD_CREDENTIALS=0
 BASE_DIR=""
 ACCOUNTS_DIR=""
+FILES_DIR=""
 SELECTED=()
 
 if [[ -t 1 ]]; then
@@ -114,6 +128,8 @@ open_url() {
   open "$1" 2>/dev/null
 }
 
+timestamp() { date +%Y%m%d-%H%M%S; }
+
 # --- Assumptions --------------------------------------------------------------
 
 confirm_or_quit() {
@@ -134,7 +150,7 @@ check_assumptions() {
   banner "Before we start"
 
   if [[ "$(uname)" != "Darwin" ]]; then
-    err "This script is for macOS (it sets up Claude Desktop's Mac config)."
+    err "This script only works on macOS (it sets up Claude Desktop's Mac config). Nothing was changed."
     exit 1
   fi
 
@@ -177,11 +193,19 @@ check_assumptions() {
   ok "All set."
 }
 
-# --- Section 1: Google Cloud --------------------------------------------------
+# --- OAuth client file --------------------------------------------------------
 
-gcloud_ready() {
-  command -v gcloud >/dev/null &&
-    [[ -n "$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)" ]]
+# 0 = a Desktop app client, 2 = a Web application client, 1 = not a client file.
+check_client_json() {
+  node -e 'try { const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.exit(j.installed ? 0 : j.web ? 2 : 1); } catch { process.exit(1); }' "$1"
+}
+
+has_credentials() { [[ -f "$CREDENTIALS_PATH" ]] && check_client_json "$CREDENTIALS_PATH"; }
+
+# The project the installed OAuth client belongs to.
+credentials_project_id() {
+  node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).installed.project_id || ""); } catch {}' \
+    "$CREDENTIALS_PATH"
 }
 
 # Newest Google OAuth client download in Downloads or Desktop.
@@ -189,18 +213,16 @@ find_client_json() {
   ls -t "$HOME/Downloads"/client_secret_*.json "$HOME/Desktop"/client_secret_*.json 2>/dev/null | head -1
 }
 
-# 0 = a Desktop app client, 2 = a Web application client, 1 = not a client file.
-check_client_json() {
-  node -e 'try { const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.exit(j.installed ? 0 : j.web ? 2 : 1); } catch { process.exit(1); }' "$1"
-}
-
 # Finds the downloaded client JSON (waiting for it if needed) and moves it to
-# ~/.google-mcp/credentials.json.
+# ~/.google-mcp/credentials.json. An existing client is kept unless the user
+# types "replace": swapping clients signs every connected account out.
 install_credentials() {
-  local src status
-  if [[ -f "$CREDENTIALS_PATH" ]] && check_client_json "$CREDENTIALS_PATH"; then
-    ok "You already have an OAuth client at $CREDENTIALS_PATH."
-    yes_key "Replace it with a newly downloaded one?" || return 0
+  local src status answer
+  if has_credentials; then
+    ok "You already have an OAuth client at $CREDENTIALS_PATH, so there's nothing to do here."
+    say "Replacing it with a different client signs out every connected account until you sign each in again."
+    read -r -p "Press Enter to keep it (recommended), or type replace: " answer
+    [[ "$(lower "$(trim "$answer")")" == "replace" ]] || return 0
   fi
 
   while true; do
@@ -227,7 +249,7 @@ install_credentials() {
     if [[ "$status" == 0 ]]; then
       break
     elif [[ "$status" == 2 ]]; then
-      err "That's a \"Web application\" client. Go back to step 5 and create a ${BOLD}Desktop app${RESET} client instead."
+      err "That's a \"Web application\" client. Create a ${BOLD}Desktop app${RESET} client instead (section 1, step 5)."
     else
       err "\"$src\" isn't a Google OAuth client file."
     fi
@@ -236,36 +258,172 @@ install_credentials() {
   done
 
   mkdir -p "$GOOGLE_MCP_DIR" && chmod 700 "$GOOGLE_MCP_DIR"
+  if [[ -f "$CREDENTIALS_PATH" ]]; then
+    local backup
+    backup="$CREDENTIALS_PATH.backup-$(timestamp)"
+    cp -p "$CREDENTIALS_PATH" "$backup" && ok "Backed up the old client to $backup."
+  fi
   mv "$src" "$CREDENTIALS_PATH" && chmod 600 "$CREDENTIALS_PATH"
   ok "Moved it to $CREDENTIALS_PATH (readable only by you)."
 }
 
+# --- gcloud CLI ---------------------------------------------------------------
+
+# A Python new enough for gcloud (3.10+), or nothing.
+find_python() {
+  local py
+  for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    command -v "$py" >/dev/null 2>&1 || continue
+    if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+      command -v "$py"
+      return 0
+    fi
+  done
+  return 1
+}
+
+gcloud_works() { [[ -n "$GCLOUD" ]] && "$GCLOUD" --version >/dev/null 2>&1; }
+
+find_gcloud() {
+  local candidate
+  for candidate in "$(command -v gcloud)" "$GCLOUD_SDK_DIR/bin/gcloud" /opt/homebrew/bin/gcloud /usr/local/bin/gcloud; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    GCLOUD="$candidate"
+    gcloud_works && return 0
+  done
+  GCLOUD=""
+  return 1
+}
+
+# Google's tarball, unpacked to ~/google-cloud-sdk. Its install.sh isn't run,
+# so no shell config files are touched.
+download_gcloud() {
+  local arch url tmp
+  if [[ -e "$GCLOUD_SDK_DIR" ]]; then
+    err "$GCLOUD_SDK_DIR exists but its gcloud doesn't run, so I'm leaving it alone."
+    return 1
+  fi
+  [[ "$(uname -m)" == "arm64" ]] && arch=arm || arch=x86_64
+  url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-$arch.tar.gz"
+  tmp=$(mktemp -d)
+  say "Downloading the gcloud CLI (about 55 MB) into $GCLOUD_SDK_DIR..."
+  if curl -fL --progress-bar "$url" | tar -xzf - -C "$tmp" && mv "$tmp/google-cloud-sdk" "$GCLOUD_SDK_DIR"; then
+    rm -rf "$tmp"
+    GCLOUD="$GCLOUD_SDK_DIR/bin/gcloud"
+  else
+    rm -rf "$tmp"
+    err "The download didn't work."
+    return 1
+  fi
+}
+
+# Uses gcloud if it's already here, otherwise installs it (Homebrew if you
+# have it, else Google's download).
+ensure_gcloud() {
+  if find_gcloud; then
+    ok "Using the gcloud CLI at $GCLOUD."
+    return 0
+  fi
+
+  local python
+  python=$(find_python)
+  if command -v brew >/dev/null; then
+    say "I'll install Google's gcloud CLI with Homebrew and use it to create the project and turn on the APIs for you."
+    yes_key "Install it now?" || return 1
+    brew install --cask gcloud-cli || { err "Homebrew couldn't install gcloud."; return 1; }
+  elif [[ -n "$python" ]]; then
+    export CLOUDSDK_PYTHON="$python"
+    say "I'll download Google's gcloud CLI and use it to create the project and turn on the APIs for you."
+    say "It goes in $GCLOUD_SDK_DIR and doesn't change any of your shell settings."
+    yes_key "Download it now?" || return 1
+    download_gcloud || return 1
+  else
+    warn "gcloud needs Python 3.10 or newer (or Homebrew to install it), and this Mac has neither."
+    return 1
+  fi
+
+  if find_gcloud; then
+    ok "gcloud is installed: $GCLOUD"
+    return 0
+  fi
+  err "gcloud is installed but doesn't start."
+  return 1
+}
+
+g() { "$GCLOUD" --quiet "$@"; }
+
+gcloud_active_account() { g auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1; }
+
+gcloud_login() {
+  local account
+  account=$(gcloud_active_account)
+  if [[ -n "$account" ]] && yes_key "gcloud is signed in as ${BOLD}$account${RESET}. Use this Google account to own the project?"; then
+    GCLOUD_ACCOUNT="$account"
+    return 0
+  fi
+  say "Your browser will open. Sign in with the Google account that should own the project"
+  say "(any of yours; it doesn't have to be one you'll connect), then click ${BOLD}Allow${RESET}."
+  pause "Press any key to open the browser."
+  "$GCLOUD" auth login --brief || { err "gcloud sign-in didn't finish."; return 1; }
+  GCLOUD_ACCOUNT=$(gcloud_active_account)
+  [[ -n "$GCLOUD_ACCOUNT" ]] && ok "gcloud is signed in as $GCLOUD_ACCOUNT."
+}
+
+# Reuses the project an earlier run created, or creates one.
+gcloud_project() {
+  local id
+  id=$(g projects list --filter="labels.$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE" --format='value(projectId)' 2>/dev/null | head -1)
+  if [[ -n "$id" ]]; then
+    PROJECT_ID="$id"
+    ok "Reusing your project $id (created by an earlier run)."
+    return 0
+  fi
+  id="google-mcp-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+  until g projects create "$id" --name="Google MCP" --labels="$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE"; do
+    warn "Google didn't create the project. A new Google Cloud account first has to accept the Terms of Service."
+    open_url "https://console.cloud.google.com/"
+    say "Accept the terms on that page if it asks, then come back."
+    say "  Press ENTER or SPACE to try again, any other key to do this step in the browser instead."
+    key_go || return 1
+  done
+  PROJECT_ID="$id"
+  ok "Created project $id."
+}
+
+# --- Section 1: Google Cloud --------------------------------------------------
+
 google_project_step() {
   step "1 of 6" "Create a Google Cloud project"
-  if gcloud_ready && yes_key "You have the gcloud CLI signed in. Create the project with it, so you don't have to click through?"; then
-    PROJECT_ID="google-mcp-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-    if gcloud projects create "$PROJECT_ID" --name="Google MCP"; then
-      ok "Created project $PROJECT_ID."
-      USE_GCLOUD=1
+  local id
+  if [[ "$HAD_CREDENTIALS" == 1 ]]; then
+    id=$(credentials_project_id)
+    if [[ -n "$id" ]]; then
+      PROJECT_ID="$id"
+      ok "You already have a project: $id (your OAuth client belongs to it). Nothing to create."
+      find_gcloud >/dev/null
       pause
       return
     fi
-    warn "gcloud couldn't create the project. Let's do it in the browser instead."
-    PROJECT_ID=""
   fi
 
+  if ensure_gcloud && gcloud_login && gcloud_project; then
+    pause
+    return
+  fi
+
+  warn "Let's do this step in the browser instead."
   say "Opening the Google Cloud \"New project\" page:"
   open_url "https://console.cloud.google.com/projectcreate"
   say ""
   say "  1. Project name: anything, e.g. ${BOLD}google-mcp${RESET}"
   say "  2. Organization / Location: leave as is (\"No organization\" is fine)."
   say "  3. Click ${BOLD}Create${RESET} and wait a few seconds for it to finish."
+  say "${DIM}(If you made one on an earlier run, don't make another: just select it in the project picker.)${RESET}"
   pause "When the project is created, press any key."
 
   say ""
   say "Paste the project ${BOLD}ID${RESET} (shown under the project name, e.g. google-mcp-471203),"
   say "so the next links open straight to this project. Just press Enter to skip."
-  local id
   read -r -p "> " id
   id=$(trim "$id")
   if [[ "$id" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
@@ -274,21 +432,22 @@ google_project_step() {
   elif [[ -n "$id" ]]; then
     warn "That doesn't look like a project ID, so the links will open without one. Pick the project in the picker at the top of each page."
   else
-    say "OK. On each page, make sure your new project is selected in the picker at the top."
+    say "OK. On each page, make sure your project is selected in the picker at the top."
   fi
   pause
 }
 
 google_apis_step() {
   step "2 of 6" "Enable the Google APIs"
-  if [[ "$USE_GCLOUD" == 1 ]]; then
-    say "Enabling Gmail, Calendar, Drive, Docs, Sheets and Slides APIs with gcloud..."
-    if gcloud services enable "${APIS[@]}" --project "$PROJECT_ID"; then
+  # Enabling an API that's already on is a no-op, so this is safe to repeat.
+  if [[ -n "$PROJECT_ID" ]] && gcloud_works && [[ -n "$(gcloud_active_account)" ]]; then
+    say "Turning on the Gmail, Calendar, Drive, Docs, Sheets and Slides APIs in $PROJECT_ID..."
+    if g services enable "${APIS[@]}" --project "$PROJECT_ID"; then
       ok "All six APIs are enabled."
       pause
       return
     fi
-    warn "gcloud couldn't enable them. Let's do it in the browser instead."
+    warn "gcloud couldn't enable them (is it signed in as the project's owner?). Let's do it in the browser instead."
   fi
 
   local ids
@@ -296,7 +455,7 @@ google_apis_step() {
   say "Opening a page that enables all six APIs at once (Gmail, Calendar, Drive, Docs, Sheets, Slides):"
   open_url "$(console_url "flows/enableapi?apiid=$ids")"
   say ""
-  say "  1. Check that your new project is the one selected."
+  say "  1. Check that your project is the one selected."
   say "  2. Click ${BOLD}Next${RESET}, then ${BOLD}Enable${RESET}."
   say ""
   say "${DIM}If that page doesn't work, go to APIs & Services → Library and enable each one by name.${RESET}"
@@ -305,13 +464,19 @@ google_apis_step() {
 
 google_consent_step() {
   step "3 of 6" "Set up the OAuth consent screen"
-  say "Opening Google Auth Platform:"
+  if [[ "$HAD_CREDENTIALS" == 1 ]]; then
+    ok "Already done: you have an OAuth client, and Google only lets you make one after this step."
+    pause
+    return
+  fi
+  local email="${GCLOUD_ACCOUNT:-your email}"
+  say "Google doesn't let any tool do this part, so it's a few clicks. Opening Google Auth Platform:"
   open_url "$(console_url "auth/overview")"
   say ""
   say "  1. Click ${BOLD}Get started${RESET}."
-  say "  2. App information: App name ${BOLD}Google MCP${RESET}, User support email: your email. ${BOLD}Next${RESET}."
+  say "  2. App information: App name ${BOLD}Google MCP${RESET}, User support email ${BOLD}$email${RESET}. ${BOLD}Next${RESET}."
   say "  3. Audience: ${BOLD}External${RESET}. ${BOLD}Next${RESET}."
-  say "  4. Contact information: your email. ${BOLD}Next${RESET}."
+  say "  4. Contact information: ${BOLD}$email${RESET}. ${BOLD}Next${RESET}."
   say "  5. Tick the agreement and click ${BOLD}Create${RESET}."
   say ""
   say "${DIM}You don't need to add any scopes here; the sign-in step asks for them itself.${RESET}"
@@ -325,15 +490,21 @@ google_test_users_step() {
   say ""
   say "  1. Under ${BOLD}Test users${RESET}, click ${BOLD}+ Add users${RESET}."
   say "  2. Enter ${BOLD}every Google address you're going to connect${RESET} (work, personal, ...)."
+  say "     Addresses already on the list stay there; only add new ones."
   say "  3. Click ${BOLD}Save${RESET}."
   say ""
-  say "Leave the app in ${BOLD}Testing${RESET}. Any address you leave off here gets \"Error 403: access_denied\" when it signs in."
+  say "Leave the app in ${BOLD}Testing${RESET}. Any address left off here gets \"Error 403: access_denied\" when it signs in."
   pause
 }
 
 google_client_step() {
   step "5 of 6" "Create the OAuth client and download it"
-  say "Opening the \"Create client\" page:"
+  if [[ "$HAD_CREDENTIALS" == 1 ]]; then
+    ok "Already done: your OAuth client is at $CREDENTIALS_PATH."
+    pause
+    return
+  fi
+  say "Google doesn't let any tool do this part either. Opening the \"Create client\" page:"
   open_url "$(console_url "auth/clients/create")"
   say ""
   say "  1. Application type: ${BOLD}Desktop app${RESET}  (not \"Web application\")."
@@ -353,6 +524,7 @@ section_google() {
   section_gate 1 "Google Cloud setup" \
     "Creates the Google Cloud project and OAuth client every account and server shares. You only ever do this once." ||
     return 0
+  has_credentials && HAD_CREDENTIALS=1
   google_project_step
   google_apis_step
   google_consent_step
@@ -378,30 +550,39 @@ clone_or_update() {
   local repo="$1" dest="$BASE_DIR/$1"
   if [[ -d "$dest/.git" ]]; then
     say "$repo is already at $dest. Pulling the latest..."
+    # --ff-only never merges or discards anything; with local changes it just stops.
     git -C "$dest" pull --ff-only || warn "Couldn't update $repo (local changes?). Using it as it is."
   elif [[ -e "$dest" ]]; then
-    err "$dest already exists and isn't a git repo. Move it out of the way and run this again."
+    err "$dest already exists and isn't a git repo, so I'm leaving it alone."
     return 1
   else
     git clone "git@github.com:$GH_OWNER/$repo.git" "$dest" || return 1
   fi
 }
 
+# npm ci installs exactly what's in package-lock.json and never rewrites it,
+# so re-running doesn't leave changes in the repo.
 npm_install() {
-  say "Installing $(basename "$1")'s dependencies..."
-  (cd "$1" && npm install --no-fund --no-audit) || { err "npm install failed in $1"; return 1; }
-  ok "$(basename "$1") is installed."
+  local name
+  name=$(basename "$1")
+  say "Installing $name's dependencies..."
+  (cd "$1" && { npm ci --no-fund --no-audit || npm install --no-fund --no-audit; }) ||
+    { err "npm install failed in $1"; return 1; }
+  ok "$name is installed."
 }
 
 repos_accounts_step() {
   step "1 of 5" "Get google-mcp-accounts"
-  if detect_accounts_dir; then
-    ok "You're running this from $ACCOUNTS_DIR, so the servers will go next to it in $BASE_DIR."
+  if [[ -n "$ACCOUNTS_DIR" ]]; then
+    ok "You're running this from $ACCOUNTS_DIR, so the servers go next to it in $BASE_DIR."
   else
+    # Default to wherever an earlier run put the repos.
+    local dir default
+    default=$(claude_config existing-base)
+    [[ -n "$default" ]] || default="$HOME/google-mcp"
     say "Where should the repos go? Press Enter for the default."
-    local dir
-    read -r -p "Folder [$HOME/google-mcp]: " dir
-    dir=$(clean_path "${dir:-$HOME/google-mcp}")
+    read -r -p "Folder [$default]: " dir
+    dir=$(clean_path "${dir:-$default}")
     mkdir -p "$dir" || { err "Couldn't create $dir"; exit 1; }
     BASE_DIR=$(cd "$dir" && pwd)
     ACCOUNTS_DIR="$BASE_DIR/$ACCOUNTS_REPO"
@@ -413,7 +594,7 @@ repos_accounts_step() {
 
 repos_servers_step() {
   step "2 of 5" "Pick the servers you want"
-  local i
+  local i repo
   SELECTED=()
   for i in "${!REPOS[@]}"; do
     if yes_key "Use ${BOLD}${REPO_LABELS[$i]}${RESET} (${REPOS[$i]})?"; then
@@ -426,19 +607,17 @@ repos_servers_step() {
     return
   fi
   say ""
-  for i in "${SELECTED[@]}"; do
-    if clone_or_update "$i" && npm_install "$BASE_DIR/$i"; then
-      :
-    else
-      err "Skipping $i."
-      SELECTED=($(printf '%s\n' "${SELECTED[@]}" | grep -vx "$i"))
+  for repo in "${SELECTED[@]}"; do
+    if ! { clone_or_update "$repo" && npm_install "$BASE_DIR/$repo"; }; then
+      err "Skipping $repo."
+      SELECTED=($(printf '%s\n' "${SELECTED[@]}" | grep -vx "$repo"))
     fi
   done
   pause
 }
 
 ensure_credentials() {
-  [[ -f "$CREDENTIALS_PATH" ]] && check_client_json "$CREDENTIALS_PATH" && return 0
+  has_credentials && return 0
   warn "There's no OAuth client at $CREDENTIALS_PATH yet (that's section 1, step 5)."
   say "If you've already downloaded it, I'll find it now."
   install_credentials
@@ -448,7 +627,20 @@ auth() { (cd "$ACCOUNTS_DIR" && node auth.js "$@"); }
 
 account_count() {
   node -e 'try { console.log(Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))).length); } catch { console.log(0); }' \
-    "$GOOGLE_MCP_DIR/accounts.json"
+    "$ACCOUNTS_PATH"
+}
+
+# The address an alias or nickname is connected to, or nothing.
+account_email() {
+  node -e '
+    try {
+      const accounts = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const name = process.argv[2];
+      const alias = Object.hasOwn(accounts, name)
+        ? name
+        : Object.keys(accounts).find((a) => (accounts[a].nicknames || []).includes(name));
+      if (alias) console.log(accounts[alias].email);
+    } catch {}' "$ACCOUNTS_PATH" "$1"
 }
 
 add_nicknames() {
@@ -470,18 +662,20 @@ add_nicknames() {
       [[ -z "$nick" ]] && continue
       if [[ ! "$nick" =~ $NAME_PATTERN ]]; then
         err "\"$nick\" isn't allowed. Use only letters, digits, - and _."
-        continue
+      elif [[ -n "$(account_email "$nick")" && "$(account_email "$nick")" == "$(account_email "$alias")" ]]; then
+        ok "\"$nick\" already points to $alias."
+      else
+        auth --nick "$alias" "$nick"
       fi
-      auth --nick "$alias" "$nick"
     done
   done
 }
 
 connect_one() {
-  local alias="$1" cancelled=0
+  local alias="$1" before="$2" cancelled=0 status after
   say ""
   say "Your browser will open a Google sign-in page. There:"
-  say "  1. Pick (or sign in to) the Google account you want to call ${BOLD}$alias${RESET}."
+  say "  1. Pick (or sign in to) the Google account you want to call ${BOLD}$alias${RESET}${before:+ (${BOLD}$before${RESET})}."
   say "  2. On \"Google hasn't verified this app\", click ${BOLD}Continue${RESET} (sometimes under ${BOLD}Advanced${RESET})."
   say "  3. Leave ${BOLD}every permission ticked${RESET} and click ${BOLD}Continue${RESET}."
   say "  4. When the tab says \"Account connected\", come back here."
@@ -489,17 +683,22 @@ connect_one() {
   pause "Press any key to open the browser."
   trap 'cancelled=1' INT
   auth "$alias"
-  local status=$?
+  status=$?
   trap - INT
   if [[ "$cancelled" == 1 || "$status" != 0 ]]; then
     [[ "$cancelled" == 1 ]] && warn "Sign-in cancelled." || err "That account didn't connect."
     say "Common causes: the address isn't a test user (section 1, step 4), or you unticked a permission."
     return 1
   fi
+  after=$(account_email "$alias")
+  if [[ -n "$before" && "$after" != "$before" ]]; then
+    warn "\"$alias\" used to be $before and is now $after."
+    say "If that's not what you wanted, run this step again with alias $alias and sign in as $before."
+  fi
 }
 
 connect_accounts() {
-  local alias
+  local alias email
   while true; do
     say ""
     say "Type an ${BOLD}alias${RESET} for the Google account to connect (e.g. ${BOLD}work${RESET}, ${BOLD}personal${RESET})."
@@ -518,7 +717,13 @@ connect_accounts() {
       err "Use only letters, digits, - and _ (e.g. work, personal-2)."
       continue
     fi
-    connect_one "$alias" && add_nicknames "$alias"
+    email=$(account_email "$alias")
+    if [[ -n "$email" ]]; then
+      say "\"$alias\" is already connected to ${BOLD}$email${RESET}."
+      yes_key "Sign in to it again to refresh it? (Sign in as $email; a different account would take over this alias.)" ||
+        continue
+    fi
+    connect_one "$alias" "$email" && add_nicknames "$alias"
   done
 }
 
@@ -530,7 +735,7 @@ repos_connect_step() {
     return
   fi
   if [[ "$(account_count)" != 0 ]]; then
-    say "Already connected:"
+    say "Already connected (these stay as they are unless you re-connect one):"
     auth --list
   fi
   connect_accounts
@@ -559,7 +764,9 @@ fix_accounts_menu() {
       ;;
     4)
       read -r -p "Which alias? " alias
-      auth --remove "$(trim "$alias")"
+      alias=$(trim "$alias")
+      yes_key "Remove \"$alias\" ($(account_email "$alias"))? You'd have to sign in again to get it back." &&
+        auth --remove "$alias"
       ;;
   esac
 }
@@ -584,8 +791,11 @@ repos_review_step() {
   pause
 }
 
-# Prints (mode "print") or merges into Claude's config (mode "write") an
-# mcpServers entry for each selected server.
+# Claude Desktop config helper. Modes:
+#   print          the mcpServers entries for the selected servers, as JSON
+#   write          merge them into Claude's config (exits 3 if nothing changed)
+#   existing-base  the folder an earlier run put the servers in
+#   existing-files the shared files folder an earlier run set
 claude_config() {
   node - "$1" "$CLAUDE_CONFIG" "$(command -v node)" "$BASE_DIR" "$FILES_DIR" "${SELECTED[@]}" <<'EOF'
 const fs = require("fs");
@@ -597,6 +807,33 @@ const SERVERS = {
   "multi-gdrive-mcp": ["multi-gdrive", "MULTI_GDRIVE_MCP_FILES_DIR"],
   "gworkspace-docs-sheets-slides-mcp": ["gworkspace-docs-sheets-slides", "GWORKSPACE_MCP_FILES_DIR"],
 };
+
+let raw = "";
+let config = {};
+if (fs.existsSync(configPath)) {
+  raw = fs.readFileSync(configPath, "utf8");
+  try {
+    config = raw.trim() ? JSON.parse(raw) : {};
+  } catch {
+    if (mode.startsWith("existing")) process.exit(0);
+    console.error(`${configPath} isn't valid JSON, so it was left alone. Fix it or use the paste-a-prompt option.`);
+    process.exit(1);
+  }
+}
+const existing = config.mcpServers || {};
+
+if (mode.startsWith("existing")) {
+  const found = Object.values(SERVERS)
+    .map(([key, envVar]) => {
+      const entry = existing[key];
+      if (mode === "existing-base") return entry?.args?.[0] && path.resolve(entry.args[0], "../../..");
+      return envVar && entry?.env?.[envVar];
+    })
+    .find(Boolean);
+  if (found) console.log(found);
+  process.exit(0);
+}
+
 const entries = {};
 for (const repo of repos) {
   const [key, envVar] = SERVERS[repo];
@@ -607,27 +844,29 @@ if (mode === "print") {
   console.log(JSON.stringify({ mcpServers: entries }, null, 2));
   process.exit(0);
 }
-let config = {};
-if (fs.existsSync(configPath)) {
-  const raw = fs.readFileSync(configPath, "utf8");
-  try {
-    config = raw.trim() ? JSON.parse(raw) : {};
-  } catch {
-    console.error(`${configPath} isn't valid JSON, so it was left alone. Fix it or use the paste-a-prompt option.`);
-    process.exit(1);
-  }
-  const backup = `${configPath}.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-  fs.copyFileSync(configPath, backup);
-  console.log(`Backed up your current config to ${backup}`);
-}
-const existing = config.mcpServers || {};
+
 for (const [key, entry] of Object.entries(entries)) {
-  // Keep any extra settings already added to this server's env.
-  if (entry.env || existing[key]?.env) entry.env = { ...existing[key]?.env, ...entry.env };
+  // Keep any other settings already on this server: its other env vars and fields.
+  const old = existing[key] || {};
+  const env = { ...old.env, ...entry.env };
+  entries[key] = { ...old, ...entry, ...(Object.keys(env).length && { env }) };
 }
 config.mcpServers = { ...existing, ...entries };
+const updated = JSON.stringify(config, null, 2) + "\n";
+if (raw && JSON.stringify(JSON.parse(raw)) === JSON.stringify(config)) {
+  console.log(`Claude's config already has ${Object.keys(entries).join(", ")}, so nothing changed.`);
+  process.exit(3);
+}
+if (raw) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  fs.copyFileSync(configPath, `${configPath}.backup-${stamp}`);
+  console.log(`Backed up your current config to ${configPath}.backup-${stamp}`);
+}
 fs.mkdirSync(path.dirname(configPath), { recursive: true });
-fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+// Write a temp file and rename it, so Claude never sees a half-written config.
+const tmp = `${configPath}.${process.pid}.tmp`;
+fs.writeFileSync(tmp, updated);
+fs.renameSync(tmp, configPath);
 console.log(`Added ${Object.keys(entries).join(", ")} to ${configPath}`);
 EOF
 }
@@ -651,7 +890,8 @@ Add these MCP servers to my Claude Desktop config at
 
 - Back up the file first.
 - Merge these entries into the existing "mcpServers" object. Keep every server
-  that's already there; if one of these names already exists, replace it.
+  that's already there; if one of these names already exists, replace its
+  "command" and "args" and merge its "env", keeping any other settings on it.
 - If the file doesn't exist, create it with just this content.
 - Make sure the result is valid JSON.
 - Create the folder $FILES_DIR if it doesn't exist.
@@ -669,11 +909,16 @@ repos_claude_step() {
     return
   fi
 
+  local dir default
+  default=$(claude_config existing-files)
+  [[ -n "$default" ]] || default="$HOME/Downloads/google-mcp-files"
   say "The Gmail, Drive and Docs/Sheets/Slides servers share one folder for files they download or attach."
-  local dir
-  read -r -p "Files folder [$HOME/Downloads/google-mcp-files]: " dir
-  FILES_DIR=$(clean_path "${dir:-$HOME/Downloads/google-mcp-files}")
-  mkdir -p "$FILES_DIR" && chmod 700 "$FILES_DIR"
+  read -r -p "Files folder [$default]: " dir
+  FILES_DIR=$(clean_path "${dir:-$default}")
+  # Only lock down a folder this script creates; never change an existing one.
+  if [[ ! -d "$FILES_DIR" ]]; then
+    mkdir -p "$FILES_DIR" && chmod 700 "$FILES_DIR"
+  fi
 
   local choice
   while true; do
@@ -689,13 +934,19 @@ repos_claude_step() {
   done
 
   if [[ "$choice" == 1 ]]; then
-    claude_config write || return 1
-    say ""
-    if yes_key "Claude needs a full restart to load them. Quit and reopen Claude Desktop now?"; then
-      restart_claude
-    else
-      say "Quit Claude with Cmd+Q (not just closing the window) and reopen it when you're ready."
-    fi
+    claude_config write
+    case $? in
+      0)
+        say ""
+        if yes_key "Claude needs a full restart to load them. Quit and reopen Claude Desktop now?"; then
+          restart_claude
+        else
+          say "Quit Claude with Cmd+Q (not just closing the window) and reopen it when you're ready."
+        fi
+        ;;
+      3) ;;
+      *) return 1 ;;
+    esac
   else
     local prompt
     prompt=$(claude_prompt)
@@ -730,8 +981,9 @@ main() {
   [[ -t 0 ]] || exec </dev/tty
 
   banner "Google MCP servers for Claude: guided setup"
-  say "This walks you through everything, one step at a time. For each step it opens"
-  say "the right page or runs the command for you, then waits for you before moving on."
+  say "This walks you through everything, one step at a time. For each step it does the work"
+  say "itself or opens the right page, then waits for you before moving on."
+  say "It's safe to run again: what's already set up is reused, never replaced without asking."
 
   detect_accounts_dir
   check_assumptions
@@ -745,4 +997,6 @@ main() {
   say ""
 }
 
-[[ -n "${SETUP_SH_NO_MAIN:-}" ]] || main "$@"
+# exit right after main, so a git pull that updates this file mid-run can't
+# make bash read the rest of a changed file.
+[[ -n "${SETUP_SH_NO_MAIN:-}" ]] || { main "$@"; exit $?; }

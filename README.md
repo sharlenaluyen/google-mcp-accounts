@@ -67,6 +67,15 @@ you to re-run auth instead of failing with an opaque 403.
 
 ## Setup
 
+On macOS, `setup.sh` walks you through every step below, one at a time, and
+connects the servers to Claude Desktop. It's safe to re-run. Without cloning:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup.sh)
+```
+
+To do it by hand instead:
+
 You need one Google Cloud project with one OAuth client. Every account you
 connect, and all four servers, share it. You only do steps 1-5 once.
 
