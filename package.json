@@ -1,0 +1,40 @@
+{
+  "name": "google-mcp-accounts",
+  "version": "1.0.0",
+  "description": "Shared OAuth account store, audit log and retry helper for the local Google MCP servers - log into each Google account once",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./store": "./store.js",
+    "./audit": "./audit.js",
+    "./retry": "./retry.js",
+    "./accounts": "./accounts.js",
+    "./files": "./files.js",
+    "./scopes": "./scopes.js"
+  },
+  "bin": {
+    "google-mcp-auth": "auth.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "auth": "node auth.js",
+    "accounts": "node auth.js --list",
+    "test": "node --test tests/*.test.js",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "google-auth-library": "^11.3.1",
+    "open": "^10.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.10"
+  }
+}
