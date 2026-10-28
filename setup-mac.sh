@@ -7,8 +7,8 @@
 # config entries are reused or merged, never thrown away. Anything it replaces
 # is backed up first.
 #
-# Run from a clone:   ./setup.sh
-# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup.sh)
+# Run from a clone:   ./setup-mac.sh
+# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup-mac.sh)
 
 GH_OWNER="sharlenaluyen"
 ACCOUNTS_REPO="google-mcp-accounts"

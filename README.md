@@ -67,11 +67,11 @@ you to re-run auth instead of failing with an opaque 403.
 
 ## Setup
 
-On macOS, `setup.sh` walks you through every step below, one at a time, and
+On macOS, `setup-mac.sh` walks you through every step below, one at a time, and
 connects the servers to Claude Desktop. It's safe to re-run. Without cloning:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup-mac.sh)
 ```
 
 To do it by hand instead:
