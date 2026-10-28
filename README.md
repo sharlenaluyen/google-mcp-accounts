@@ -67,9 +67,65 @@ you to re-run auth instead of failing with an opaque 403.
 
 ## Setup
 
-1. Enable the Gmail, Calendar, Drive, Docs, Sheets, and Slides APIs on your
-   Google Cloud project.
-2. Put the OAuth **Desktop app** client JSON at `~/.google-mcp/credentials.json`:
+You need one Google Cloud project with one OAuth client. Every account you
+connect, and all four servers, share it. You only do steps 1-5 once.
+
+1. **Create a project.** Go to <https://console.cloud.google.com/>, open the
+   project picker at the top of the page, and click **New project**. Give it
+   any name (e.g. `google-mcp`). No organization is needed. Make sure the new
+   project is selected in the picker before going on.
+
+2. **Enable the APIs.** Go to **APIs & Services → Library**, then search for
+   and **Enable** each of these:
+   - Gmail API
+   - Google Calendar API
+   - Google Drive API
+   - Google Docs API
+   - Google Sheets API
+   - Google Slides API
+
+   If you skip one, its server fails with a 403 that says the API "has not
+   been used in project ... or it is disabled".
+
+3. **Set up the OAuth consent screen.** Go to **APIs & Services → OAuth
+   consent screen** (also called **Google Auth Platform**) and click **Get
+   started**:
+   - **App information**: any app name (e.g. `Google MCP`), and your email as
+     the support email.
+   - **Audience**: **External** (pick **Internal** only if every account you
+     connect is in the same Google Workspace organization as the project).
+   - **Contact information**: your email.
+   - Agree to the policy and click **Create**.
+
+   You don't need to add scopes here. `auth.js` asks for them itself, and
+   Google shows them on the consent screen.
+
+4. **Add test users.** A new External app is in **Testing** mode, and only
+   listed test users can sign in to it. Go to **Audience → Test users → Add
+   users** and add **every Google address you'll connect** (work, personal,
+   ...). Up to 100 are allowed. Signing in with an address that isn't listed
+   fails with `Error 403: access_denied`.
+
+   Leave the app in Testing. It's fine for personal use, and you never need
+   Google's verification. When you connect an account, Google warns that it
+   "hasn't verified this app". Click **Continue** (on some screens it's under
+   **Advanced**). Note that in Testing mode Google expires refresh tokens
+   after 7 days, so you'll re-run `node auth.js <alias>` about weekly (see
+   [CLI](#cli)).
+
+5. **Create the OAuth client.** Go to **Clients** (or **APIs & Services →
+   Credentials → Create credentials → OAuth client ID**):
+   - **Application type**: **Desktop app**. Not "Web application": `auth.js`
+     listens on `http://localhost:53682` for the redirect, and only Desktop
+     clients accept any loopback port without registering it.
+   - **Name**: anything (e.g. `google-mcp-auth`).
+   - Click **Create**, then **Download JSON** in the dialog (or later, from
+     the download icon next to the client in the list).
+
+   The client secret in this file isn't treated as a real secret by Google
+   for Desktop apps, but keep it out of repos anyway.
+
+6. Put the downloaded client JSON at `~/.google-mcp/credentials.json`:
 
    ```bash
    mkdir -p ~/.google-mcp && chmod 700 ~/.google-mcp
@@ -77,7 +133,9 @@ you to re-run auth instead of failing with an opaque 403.
    chmod 600 ~/.google-mcp/credentials.json
    ```
 
-3. Install and connect each account:
+7. Install and connect each account. Each `node auth.js <alias>` opens a
+   browser. Sign in as that account, click through the unverified-app
+   warning, and leave every permission ticked:
 
    ```bash
    cd google-mcp-accounts
@@ -114,7 +172,8 @@ starts a server that can't load its accounts:
      "mcpServers": {
        "multi-gmail": {
          "command": "node",
-         "args": ["/absolute/path/to/multi-gmail-mcp/src/server.js"]
+         "args": ["/absolute/path/to/multi-gmail-mcp/src/server.js"],
+         "env": { "MULTI_GMAIL_MCP_FILES_DIR": "/Users/you/Downloads/google-mcp-files" }
        },
        "multi-gcal": {
          "command": "node",
@@ -122,21 +181,43 @@ starts a server that can't load its accounts:
        },
        "multi-gdrive": {
          "command": "node",
-         "args": ["/absolute/path/to/multi-gdrive-mcp/src/server.js"]
+         "args": ["/absolute/path/to/multi-gdrive-mcp/src/server.js"],
+         "env": { "MULTI_GDRIVE_MCP_FILES_DIR": "/Users/you/Downloads/google-mcp-files" }
        },
        "gworkspace-docs-sheets-slides": {
          "command": "node",
-         "args": ["/absolute/path/to/gworkspace-docs-sheets-slides-mcp/src/server.js"]
+         "args": ["/absolute/path/to/gworkspace-docs-sheets-slides-mcp/src/server.js"],
+         "env": { "GWORKSPACE_MCP_FILES_DIR": "/Users/you/Downloads/google-mcp-files" }
        }
      }
    }
    ```
 
-   Each server's README lists optional `env` settings (such as where
-   downloads go).
+   The `env` lines point every server at **one shared files folder**
+   (see below). Each server's README lists its other optional settings.
 6. **Fully quit and reopen Claude Desktop** (Cmd+Q, not just closing the
    window). The four servers should show up under the tools icon in a chat.
    In each one, call `list_accounts` to check that it sees your accounts.
+
+### One files folder for all the servers
+
+Each server reads and writes local files only inside its own files folder,
+and by default each has a different one (`~/Downloads/gmail-mcp`,
+`~/Downloads/drive-mcp`, `~/Downloads/gworkspace-mcp`). That breaks any
+request that crosses servers. For example, "attach this Drive doc to my
+email" needs Drive's `download_file` to save the file where Gmail's
+`attach_document` can read it, and with separate folders it can't.
+
+The fix is config only, no code: set `MULTI_GMAIL_MCP_FILES_DIR`,
+`MULTI_GDRIVE_MCP_FILES_DIR` and `GWORKSPACE_MCP_FILES_DIR` to the **same
+absolute path** in each server's `env` block, as in the example above, and
+then fully restart Claude Desktop. Each server still refuses files outside
+that one folder, so the protection stays the same; the servers just share
+it. multi-gcal-mcp never touches local files, so it needs no setting.
+
+If you share the folder, a file downloaded by any server can be attached or
+uploaded by any other one. Keep anything you wouldn't email out of that
+folder.
 
 ## CLI
 
