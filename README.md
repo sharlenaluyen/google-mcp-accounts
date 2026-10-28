@@ -48,7 +48,7 @@ subpaths `google-mcp-accounts/store`, `/audit`, `/retry`, `/accounts`,
 | --- | --- | --- |
 | `gmail.readonly`, `gmail.send`, `gmail.modify`, `gmail.labels` | multi-gmail-mcp | Read, draft, send, and label. `gmail.modify` alone covers all of it, and it's the only one the server checks for. The other three are listed so the consent screen spells each capability out. None of them allow permanent deletion of mail. |
 | `calendar.events` | multi-gcal-mcp | Read, create, update, delete, and respond to events. |
-| `calendar.calendarlist.readonly` | multi-gcal-mcp | **Added beyond the original plan.** `calendar.events` can't list your calendars (`calendarList.list` rejects it), so `list_calendars` needs this one. It's the narrowest scope that allows the call: read-only, and only the list of calendars you're subscribed to. |
+| `calendar.calendarlist.readonly` | multi-gcal-mcp | `calendar.events` can't list your calendars (`calendarList.list` rejects it), so `list_calendars` needs this one. It's the narrowest scope that allows the call: read-only, and only the list of calendars you're subscribed to. |
 | `drive.file` | multi-gdrive-mcp, and Slides export | Only files this OAuth client created or opened, **not your whole Drive**. |
 | `documents` | gworkspace-docs-sheets-slides-mcp | Read/edit Google Docs. |
 | `spreadsheets` | gworkspace-docs-sheets-slides-mcp | Read/edit Google Sheets. |
@@ -68,7 +68,7 @@ you to re-run auth instead of failing with an opaque 403.
 ## Setup
 
 1. Enable the Gmail, Calendar, Drive, Docs, Sheets, and Slides APIs on your
-   Google Cloud project (already done for this project).
+   Google Cloud project.
 2. Put the OAuth **Desktop app** client JSON at `~/.google-mcp/credentials.json`:
 
    ```bash
@@ -132,7 +132,6 @@ starts a server that can't load its accounts:
    }
    ```
 
-   If you already had `multi-gmail` configured, its entry doesn't change.
    Each server's README lists optional `env` settings (such as where
    downloads go).
 6. **Fully quit and reopen Claude Desktop** (Cmd+Q, not just closing the
