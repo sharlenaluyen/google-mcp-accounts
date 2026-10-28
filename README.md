@@ -28,7 +28,7 @@ which refuses to touch `refresh_token`, `email`, `nicknames`, or `scopes`.
 
 | Module | Purpose |
 | --- | --- |
-| `store.js` | Accounts by alias, with nicknames and arbitrary per-account fields. Writes are atomic (temp file + rename), `0600`, in a `0700` folder, and serialized in-process so concurrent tool calls can't lose an update. |
+| `store.js` | Accounts by alias, with nicknames and arbitrary per-account fields. Writes are atomic (temp file + rename), `0600`, in a `0700` folder. Every read-modify-write holds a lock file (`accounts.json.lock`), so two processes writing at once (the auth CLI and the Gmail server, say) can't lose each other's update. There's no unlocked way to write the file. |
 | `accounts.js` | `getAccountInfo`, `getConnectedAliases`, and `createAuthClient(alias, { OAuth2, requiredScopes })`. That last one builds a self-refreshing OAuth client, and if the account never granted a needed scope it fails up front with "re-run auth for this alias". |
 | `audit.js` | `logAuditEvent` / `createAuditLogger(serverName)`. JSONL, `0600`, best-effort (it never blocks the action it records), and it never logs content. |
 | `retry.js` | `withRetry` exponential backoff on 429/5xx. It's only for reads and idempotent calls. Sends, shares, invites, and edits are never auto-retried. |
@@ -101,6 +101,57 @@ node auth.js work                     # re-authorize each one to add Calendar/Dr
 
 The old folder is left untouched. Delete it yourself once everything works.
 
+## Connect to Claude
+
+This package isn't an MCP server itself, so it gets no entry in Claude's
+config. The four servers do. Do these steps in this order, so Claude never
+starts a server that can't load its accounts:
+
+1. **Install this package**: `cd google-mcp-accounts && npm install`.
+2. **Get your accounts into `~/.google-mcp/`**. Either import from the old
+   Gmail folder with `node auth.js --import-legacy`, or connect fresh with
+   `node auth.js <alias>`. Either way, re-run `node auth.js <alias>` once per
+   account so it grants Calendar, Drive, Docs, Sheets, and Slides, then
+   check with `node auth.js --list`.
+3. **Update multi-gmail-mcp** to the version that uses this package, and
+   run `npm install` there. Until step 2 is done, that version finds no
+   accounts.
+4. **Install the other three servers**: `npm install` in multi-gcal-mcp,
+   multi-gdrive-mcp, and gworkspace-docs-sheets-slides-mcp.
+5. **Add the servers to Claude.** For Claude Desktop on macOS, edit
+   `~/Library/Application Support/Claude/claude_desktop_config.json`. Use
+   absolute paths, and keep any other servers already in `mcpServers`:
+
+   ```json
+   {
+     "mcpServers": {
+       "multi-gmail": {
+         "command": "node",
+         "args": ["/absolute/path/to/multi-gmail-mcp/src/server.js"]
+       },
+       "multi-gcal": {
+         "command": "node",
+         "args": ["/absolute/path/to/multi-gcal-mcp/src/server.js"]
+       },
+       "multi-gdrive": {
+         "command": "node",
+         "args": ["/absolute/path/to/multi-gdrive-mcp/src/server.js"]
+       },
+       "gworkspace-docs-sheets-slides": {
+         "command": "node",
+         "args": ["/absolute/path/to/gworkspace-docs-sheets-slides-mcp/src/server.js"]
+       }
+     }
+   }
+   ```
+
+   If you already had `multi-gmail` configured, its entry doesn't change.
+   Each server's README lists optional `env` settings (such as where
+   downloads go).
+6. **Fully quit and reopen Claude Desktop** (Cmd+Q, not just closing the
+   window). The four servers should show up under the tools icon in a chat.
+   In each one, call `list_accounts` to check that it sees your accounts.
+
 ## CLI
 
 ```
@@ -137,11 +188,14 @@ do this so they never touch your real tokens).
   every server repo. They belong in `~/.google-mcp/`, never in a repo.
 - The OAuth callback checks a random `state` value, so a stray local request
   can't swap in a code for a different Google account.
-- The in-process write queue doesn't coordinate *between* processes (for
-  example, the auth CLI and the Gmail server writing at the same instant).
-  The atomic rename keeps the file valid either way, but one of the two
-  writes can be lost. Both writers are rare and human-initiated, so in
-  practice this doesn't come up.
+- **Concurrent writes.** Each write reads `accounts.json`, changes it, and
+  saves it while holding `~/.google-mcp/accounts.json.lock`. The lock is
+  created with `O_EXCL`, so only one process can hold it. Others wait and
+  retry for up to 10 seconds. A lock left by a crashed process is cleared
+  when its process is no longer running, or when it's over 30 seconds old.
+  Normally a write holds it for a few milliseconds. If a write ever times
+  out, the error names the process holding the lock. Reads don't take the
+  lock: the atomic rename means they always see a complete file.
 
 ## Dependency on a sibling folder: the tradeoff
 
@@ -149,7 +203,8 @@ The servers reference this package as `file:../google-mcp-accounts`. That
 works because all five repos are siblings on disk today. If they're pushed to
 separate GitHub remotes and cloned somewhere they **aren't** siblings, switch
 each server's dependency to a git URL, for example
-`"google-mcp-accounts": "github:<you>/google-mcp-accounts#v1.0.0"`.
+`"google-mcp-accounts": "github:sharlenaluyen/google-mcp-accounts#v1.0.0"`
+(after tagging a release here).
 Pin a tag so a change here can't silently alter four servers at once.
 The upside of `file:` is that changes here reach every server immediately,
 with no publish step. The downside is that it only works with this exact

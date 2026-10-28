@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
 
 // store.js computes CONFIG_DIR from GOOGLE_MCP_DIR at import time, so point
 // it at a throwaway temp directory before importing - this keeps the test
@@ -48,7 +50,7 @@ test("removeAccount deletes only the named alias", async () => {
   assert.equal(accounts.a.email, "1@x.com"); // untouched
 });
 
-test("saveAccounts never leaves a stray .tmp file behind", () => {
+test("writes never leave a stray .tmp file behind", () => {
   const dir = fs.readdirSync(store.CONFIG_DIR);
   assert.ok(!dir.some((f) => f.endsWith(".tmp")));
 });
@@ -147,4 +149,94 @@ test("loadCredentials reads a Desktop-app client file", () => {
     clientSecret: "sec",
     redirectUri: "http://localhost",
   });
+});
+
+// --- Cross-process lock ----------------------------------------------------
+
+const HELPER = fileURLToPath(new URL("./helpers/write-fields.js", import.meta.url));
+
+function runChild(args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [HELPER, ...args], {
+      env: { ...process.env, ...env },
+      stdio: "pipe",
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("exit", (code) =>
+      code === 0 ? resolve() : reject(new Error(`child exited ${code}: ${stderr}`))
+    );
+  });
+}
+
+function exitedPid() {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["-e", ""]);
+    child.on("exit", () => resolve(child.pid));
+  });
+}
+
+const writeLock = (lock) => fs.writeFileSync(store.LOCK_PATH, JSON.stringify(lock), { mode: 0o600 });
+
+test("two separate processes writing at the same time don't lose each other's updates", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmcp-lock-"));
+  fs.writeFileSync(
+    path.join(dir, "accounts.json"),
+    JSON.stringify({ main: { email: "m@x.com", refresh_token: "rt", nicknames: [] } })
+  );
+  const PER_CHILD = 40;
+  const startAt = String(Date.now() + 300); // both start writing at the same moment
+  await Promise.all([
+    runChild(["a", String(PER_CHILD), startAt], { GOOGLE_MCP_DIR: dir }),
+    runChild(["b", String(PER_CHILD), startAt], { GOOGLE_MCP_DIR: dir }),
+  ]);
+  const main = JSON.parse(fs.readFileSync(path.join(dir, "accounts.json"), "utf8")).main;
+  for (const id of ["a", "b"]) {
+    for (let i = 0; i < PER_CHILD; i++) assert.equal(main[`w${id}_${i}`], i, `lost w${id}_${i}`);
+  }
+  assert.equal(main.refresh_token, "rt");
+  assert.deepEqual(fs.readdirSync(dir), ["accounts.json"]); // no lock, temp, or stale files left behind
+});
+
+test("a lock left by a dead process is cleared instead of blocking writes", async () => {
+  writeLock({ pid: await exitedPid(), host: os.hostname(), time: Date.now(), token: "dead" });
+  await store.setAccountField("main", "after_dead_lock", "ok");
+  assert.equal(store.loadAccounts().main.after_dead_lock, "ok");
+  assert.ok(!fs.existsSync(store.LOCK_PATH));
+});
+
+test("a lock older than the stale limit is cleared even if its pid is alive (pid reuse)", async () => {
+  writeLock({ pid: process.pid, host: os.hostname(), time: Date.now() - 60_000, token: "old" });
+  await store.setAccountField("main", "after_old_lock", "ok");
+  assert.equal(store.loadAccounts().main.after_old_lock, "ok");
+});
+
+test("a half-written lock file is cleared once it's old", async () => {
+  fs.writeFileSync(store.LOCK_PATH, "");
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(store.LOCK_PATH, old, old);
+  await store.setAccountField("main", "after_empty_lock", "ok");
+  assert.equal(store.loadAccounts().main.after_empty_lock, "ok");
+});
+
+test("a fresh lock held by a live process makes writes wait until it's released", async () => {
+  writeLock({ pid: process.pid, host: os.hostname(), time: Date.now(), token: "live" });
+  const pending = store.setAccountField("main", "after_live_lock", "ok");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(store.loadAccounts().main.after_live_lock, undefined); // still waiting
+  fs.rmSync(store.LOCK_PATH);
+  await pending;
+  assert.equal(store.loadAccounts().main.after_live_lock, "ok");
+});
+
+test("importAccounts goes through the lock and refuses to overwrite an existing accounts.json", async () => {
+  const before = fs.readFileSync(store.ACCOUNTS_PATH, "utf8");
+  await assert.rejects(store.importAccounts({ x: { email: "x@x.com" } }), /already exists/);
+  assert.equal(fs.readFileSync(store.ACCOUNTS_PATH, "utf8"), before);
+  assert.ok(!fs.existsSync(store.LOCK_PATH)); // released after the refusal
+});
+
+test("saveAccounts isn't exported, so nothing can write accounts.json without the lock", () => {
+  assert.equal(store.saveAccounts, undefined);
 });

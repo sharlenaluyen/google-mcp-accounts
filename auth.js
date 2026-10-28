@@ -27,7 +27,7 @@ import {
   loadCredentials,
   upsertAccount,
   loadAccounts,
-  saveAccounts,
+  importAccounts,
   removeAccount,
   addNickname,
   removeNickname,
@@ -260,7 +260,7 @@ async function importLegacy(dir) {
   for (const alias of Object.keys(accounts)) {
     if (!Array.isArray(accounts[alias].scopes)) accounts[alias].scopes = LEGACY_SCOPES;
   }
-  saveAccounts(accounts);
+  await importAccounts(accounts).catch(fail);
   console.log(`Imported ${Object.keys(accounts).length} account(s) into ${ACCOUNTS_PATH}.`);
   console.log(
     `They still only have Gmail access. Re-run "node auth.js <alias>" for each one to grant Calendar, Drive, Docs, Sheets and Slides.`

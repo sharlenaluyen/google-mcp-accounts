@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -49,7 +50,9 @@ export function loadAccounts() {
   return JSON.parse(fs.readFileSync(ACCOUNTS_PATH, "utf8"));
 }
 
-export function saveAccounts(accounts) {
+// Not exported: every write goes through serialized() below, so nothing can
+// save accounts.json without holding the lock.
+function saveAccounts(accounts) {
   ensureConfigDir();
   // Atomic write: write to a temp file in the same directory, then rename.
   // Rename is atomic on the same filesystem, so a crash or a concurrent
@@ -59,14 +62,120 @@ export function saveAccounts(accounts) {
   fs.renameSync(tmpPath, ACCOUNTS_PATH);
 }
 
-// Serialize read-modify-write cycles within this process so two concurrent
-// calls (e.g. two tool invocations racing) can't clobber each other with a
-// stale read. This does not protect against a second OS process writing at
-// the same time, but the atomic rename in saveAccounts() keeps the file
-// itself consistent even then.
+// --- Cross-process lock ----------------------------------------------------
+// Several processes can write accounts.json: the auth CLI, the Gmail server
+// (set_default_from), or two copies of a server started by different clients.
+// Without a lock, two read-modify-write cycles that overlap would each save
+// their own copy and one update would be lost. The lock is a file created
+// with O_EXCL ("wx"), which the OS guarantees only one process can win.
+export const LOCK_PATH = `${ACCOUNTS_PATH}.lock`;
+const LOCK_TIMEOUT_MS = 10_000; // a write holds the lock for milliseconds; 10s means something is stuck
+const LOCK_STALE_MS = 30_000; // older than this, the holder is treated as gone even if its pid is reused
+const LOCK_RETRY_MS = 25;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The lock's contents, or for a lock that exists but can't be parsed (its
+// creator died between creating and writing it), just its age from mtime.
+function readLock(lockPath) {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  } catch {
+    try {
+      return { time: fs.statSync(lockPath).mtimeMs };
+    } catch {
+      return null; // gone
+    }
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0); // signal 0: existence check only
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // exists but belongs to another user
+  }
+}
+
+// A lock is stale when its holder is a dead process on this machine, or when
+// it's older than LOCK_STALE_MS (covers another host on a shared folder, and a
+// pid reused by an unrelated process).
+function isStale(lock, now = Date.now()) {
+  if (!lock || typeof lock.time !== "number") return false;
+  if (now - lock.time > LOCK_STALE_MS) return true;
+  return lock.host === os.hostname() && Number.isInteger(lock.pid) && !processIsAlive(lock.pid);
+}
+
+// Removes a stale lock without risking someone else's fresh one: the lock is
+// renamed away first (only one waiter can win that rename), and if what was
+// grabbed turns out not to be the stale lock that was inspected, it's put back.
+function breakStaleLock(stale) {
+  const grabbed = `${LOCK_PATH}.stale.${process.pid}.${crypto.randomUUID()}`;
+  try {
+    fs.renameSync(LOCK_PATH, grabbed);
+  } catch {
+    return; // another waiter already broke it
+  }
+  if (readLock(grabbed)?.token !== stale.token) {
+    try {
+      fs.linkSync(grabbed, LOCK_PATH); // no-clobber put-back
+    } catch {
+      // A newer lock already exists; the one grabbed was released meanwhile.
+    }
+  }
+  fs.rmSync(grabbed, { force: true });
+}
+
+async function acquireLock() {
+  ensureConfigDir();
+  const lock = { pid: process.pid, host: os.hostname(), time: Date.now(), token: crypto.randomUUID() };
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const fd = fs.openSync(LOCK_PATH, "wx", 0o600);
+      fs.writeSync(fd, JSON.stringify(lock));
+      fs.closeSync(fd);
+      return lock;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+    }
+    const holder = readLock(LOCK_PATH);
+    if (isStale(holder)) {
+      breakStaleLock(holder);
+      continue;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `Timed out waiting for ${LOCK_PATH}` +
+          (holder ? ` (held by process ${holder.pid} since ${new Date(holder.time).toISOString()})` : "") +
+          `. If no google-mcp auth command or server is running, delete that file and try again.`
+      );
+    }
+    await sleep(LOCK_RETRY_MS + Math.random() * LOCK_RETRY_MS);
+  }
+}
+
+function releaseLock(lock) {
+  // Only remove the lock if it's still ours; if it was broken as stale and
+  // someone else took it, deleting it would let a third process in.
+  if (readLock(LOCK_PATH)?.token === lock.token) fs.rmSync(LOCK_PATH, { force: true });
+}
+
+// Serializes read-modify-write cycles: an in-process queue keeps this
+// process's own writes in order, and the lock file keeps other processes out
+// while each cycle reads, changes, and saves accounts.json. Readers don't
+// take the lock; the atomic rename means they always see a whole file.
 let writeQueue = Promise.resolve();
 function serialized(fn) {
-  const result = writeQueue.then(fn);
+  const result = writeQueue.then(async () => {
+    const lock = await acquireLock();
+    try {
+      return fn();
+    } finally {
+      releaseLock(lock);
+    }
+  });
   // Keep the queue alive even if this write fails, so later writes still run.
   writeQueue = result.catch(() => {});
   return result;
@@ -170,6 +279,19 @@ export function removeAccount(alias) {
       );
     }
     delete accounts[alias];
+    saveAccounts(accounts);
+  });
+}
+
+// One-time import of a whole accounts file (auth.js --import-legacy). Runs
+// under the same lock as every other write, and refuses if accounts.json
+// already exists - checked while holding the lock, so a concurrent
+// "node auth.js <alias>" can't be overwritten.
+export function importAccounts(accounts) {
+  return serialized(() => {
+    if (fs.existsSync(ACCOUNTS_PATH)) {
+      throw new Error(`${ACCOUNTS_PATH} already exists - not importing over it.`);
+    }
     saveAccounts(accounts);
   });
 }

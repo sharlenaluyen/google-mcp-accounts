@@ -8,6 +8,7 @@ client_secret*.json
 # in the repo, in case they're ever copied or written here (e.g. a test run
 # with GOOGLE_MCP_DIR=.)
 accounts.json
+accounts.json.lock*
 accounts.json.*.tmp
 *.log
 
