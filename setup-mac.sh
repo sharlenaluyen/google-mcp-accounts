@@ -61,10 +61,18 @@ step() { printf '\n%s── Step %s: %s%s\n\n' "$BOLD" "$1" "$2" "$RESET"; }
 
 # --- Input --------------------------------------------------------------------
 
+# Every prompt ends here if the terminal closes (or Ctrl+D), instead of
+# reading empty answers forever.
+input_ended() {
+  printf '\n'
+  err "Input ended, so setup stopped. Nothing half-done was left behind; run it again any time."
+  exit 1
+}
+
 # Reads one key. Succeeds for Enter or Space, fails for any other key.
 key_go() {
   local key
-  IFS= read -rsn1 key
+  IFS= read -rsn1 key || input_ended
   printf '\n'
   [[ -z "$key" || "$key" == " " ]]
 }
@@ -91,7 +99,7 @@ pause() {
   local message="When you're done, press any key for the next step."
   [[ -n "$1" ]] && message="$1"
   printf '\n%s%s%s ' "$DIM" "$message" "$RESET"
-  IFS= read -rsn1 _
+  IFS= read -rsn1 _ || input_ended
   printf '\n'
 }
 
@@ -221,7 +229,10 @@ install_credentials() {
   if has_credentials; then
     ok "You already have an OAuth client at $CREDENTIALS_PATH, so there's nothing to do here."
     say "Replacing it with a different client signs out every connected account until you sign each in again."
-    read -r -p "Press Enter to keep it (recommended), or type replace: " answer
+    say ""
+    say "  ${BOLD}Press ENTER${RESET} to keep it ${DIM}(recommended)${RESET}."
+    say "  To swap in a new one, ${BOLD}type the word replace${RESET} and press ENTER."
+    read -r -p "> " answer || input_ended
     [[ "$(lower "$(trim "$answer")")" == "replace" ]] || return 0
   fi
 
@@ -231,7 +242,8 @@ install_credentials() {
       say "Waiting for the download (client_secret_....json) to show up in Downloads..."
       say "  ${DIM}(press any key to type the file's location instead)${RESET}"
       while [[ -z "$src" ]]; do
-        IFS= read -rsn1 -t 2 _ && break
+        IFS= read -rsn1 -t 2 _
+        case $? in 0) break ;; 1) input_ended ;; esac
         src=$(find_client_json)
       done
     fi
@@ -240,7 +252,7 @@ install_credentials() {
       yes_key "Use this file?" || src=""
     fi
     if [[ -z "$src" ]]; then
-      read -r -p "Drag the file into this window (or paste its path), then press Enter: " src
+      read -r -p "Drag the file into this window (or paste its path), then press Enter: " src || input_ended
       src=$(clean_path "$src")
     fi
 
@@ -424,7 +436,7 @@ google_project_step() {
   say ""
   say "Paste the project ${BOLD}ID${RESET} (shown under the project name, e.g. google-mcp-471203),"
   say "so the next links open straight to this project. Just press Enter to skip."
-  read -r -p "> " id
+  read -r -p "> " id || input_ended
   id=$(trim "$id")
   if [[ "$id" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
     PROJECT_ID="$id"
@@ -581,7 +593,7 @@ repos_accounts_step() {
     default=$(claude_config existing-base)
     [[ -n "$default" ]] || default="$HOME/google-mcp"
     say "Where should the repos go? Press Enter for the default."
-    read -r -p "Folder [$default]: " dir
+    read -r -p "Folder [$default]: " dir || input_ended
     dir=$(clean_path "${dir:-$default}")
     mkdir -p "$dir" || { err "Couldn't create $dir"; exit 1; }
     BASE_DIR=$(cd "$dir" && pwd)
@@ -648,14 +660,10 @@ add_nicknames() {
   while true; do
     say ""
     say "Add nicknames for ${BOLD}$alias${RESET}? Type them separated by commas (e.g. ${BOLD}w, job${RESET})."
-    say "Type ${BOLD}no${RESET} to move on. ${DIM}(only \"no\" moves on)${RESET}"
-    read -r -p "> " input
+    say "Press ${BOLD}ENTER${RESET} (or type ${BOLD}no${RESET}) to move on without adding any."
+    read -r -p "> " input || input_ended
     input=$(trim "$input")
-    [[ "$(lower "$input")" == "no" ]] && return
-    if [[ -z "$input" ]]; then
-      say "Type one or more nicknames, or \"no\" to move on."
-      continue
-    fi
+    [[ -z "$input" || "$(lower "$input")" == "no" ]] && return
     IFS=',' read -ra parts <<<"$input"
     for part in "${parts[@]}"; do
       nick=$(trim "$part")
@@ -703,10 +711,10 @@ connect_accounts() {
     say ""
     say "Type an ${BOLD}alias${RESET} for the Google account to connect (e.g. ${BOLD}work${RESET}, ${BOLD}personal${RESET})."
     say "You'll then sign in to the account that alias should mean."
-    say "Type ${BOLD}no${RESET} when you've connected them all. ${DIM}(only \"no\" moves on)${RESET}"
-    read -r -p "> " alias
+    say "Press ${BOLD}ENTER${RESET} (or type ${BOLD}no${RESET}) when you've connected them all; nothing changes."
+    read -r -p "> " alias || input_ended
     alias=$(trim "$alias")
-    if [[ "$(lower "$alias")" == "no" ]]; then
+    if [[ -z "$alias" || "$(lower "$alias")" == "no" ]]; then
       if [[ "$(account_count)" == 0 ]]; then
         warn "No accounts are connected yet. Connect at least one first."
         continue
@@ -751,19 +759,19 @@ fix_accounts_menu() {
   say "  3) Remove a nickname"
   say "  4) Remove an account"
   say "  5) Nothing, show the list again"
-  read -r -p "> " choice
+  read -r -p "> " choice || input_ended
   case "$(trim "$choice")" in
     1) connect_accounts ;;
     2)
-      read -r -p "Which account (alias)? " alias
+      read -r -p "Which account (alias)? " alias || input_ended
       add_nicknames "$(trim "$alias")"
       ;;
     3)
-      read -r -p "Which nickname? " nick
+      read -r -p "Which nickname? " nick || input_ended
       auth --unnick "$(trim "$nick")"
       ;;
     4)
-      read -r -p "Which alias? " alias
+      read -r -p "Which alias? " alias || input_ended
       alias=$(trim "$alias")
       yes_key "Remove \"$alias\" ($(account_email "$alias"))? You'd have to sign in again to get it back." &&
         auth --remove "$alias"
@@ -779,12 +787,12 @@ repos_review_step() {
     say "Each account's \"granted\" line should list gmail, calendar, calendarList, drive, docs, sheets and slides."
     say "If one is missing some, re-connect it with the same alias and leave every box ticked."
     say ""
-    say "Is this list correct? Type ${BOLD}yes${RESET} to continue, or ${BOLD}no${RESET} to change something."
-    read -r -p "> " answer
+    say "Is this list correct? Press ${BOLD}ENTER${RESET} (or type ${BOLD}yes${RESET}) if it is, or type ${BOLD}no${RESET} to change something."
+    read -r -p "> " answer || input_ended
     case "$(lower "$(trim "$answer")")" in
-      yes | y) break ;;
+      "" | yes | y) break ;;
       no | n) fix_accounts_menu ;;
-      *) say "Type yes or no." ;;
+      *) say "Press ENTER if it's correct, or type no." ;;
     esac
   done
   ok "Accounts confirmed."
@@ -913,7 +921,7 @@ repos_claude_step() {
   default=$(claude_config existing-files)
   [[ -n "$default" ]] || default="$HOME/Downloads/google-mcp-files"
   say "The Gmail, Drive and Docs/Sheets/Slides servers share one folder for files they download or attach."
-  read -r -p "Files folder [$default]: " dir
+  read -r -p "Files folder [$default]: " dir || input_ended
   FILES_DIR=$(clean_path "${dir:-$default}")
   # Only lock down a folder this script creates; never change an existing one.
   if [[ ! -d "$FILES_DIR" ]]; then
@@ -926,7 +934,7 @@ repos_claude_step() {
     say "How do you want to connect them?"
     say "  1) Do it for me: add them to Claude Desktop's config and restart Claude ${DIM}(recommended)${RESET}"
     say "  2) Give me a prompt to paste into Claude instead"
-    read -r -p "> " choice
+    read -r -p "> " choice || input_ended
     case "$(trim "$choice")" in
       1 | 2) break ;;
       *) say "Type 1 or 2." ;;
