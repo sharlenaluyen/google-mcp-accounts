@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Guided setup for the local Google MCP servers: Google Cloud project, OAuth
 # client, cloning the repos, connecting accounts, and wiring it all into
-# Claude Desktop. macOS only.
+# Claude Desktop. Runs on macOS, and on Windows in Git Bash (installed with
+# Git for Windows).
 #
 # Safe to re-run: existing projects, clones, credentials, accounts and Claude
 # config entries are reused or merged, never thrown away. Anything it replaces
 # is backed up first.
 #
-# Run from a clone:   ./setup-mac.sh
-# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup-mac.sh)
+# Run from a clone:   ./setup.sh
+# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/setup.sh)
 
 GH_OWNER="sharlenaluyen"
 ACCOUNTS_REPO="google-mcp-accounts"
@@ -16,10 +17,15 @@ REPOS=(multi-gmail-mcp multi-gcal-mcp multi-gdrive-mcp gworkspace-docs-sheets-sl
 REPO_LABELS=("Gmail" "Google Calendar" "Google Drive" "Google Docs, Sheets & Slides")
 APIS=(gmail.googleapis.com calendar-json.googleapis.com drive.googleapis.com docs.googleapis.com sheets.googleapis.com slides.googleapis.com)
 
+case "$(uname -s)" in
+  Darwin) OS=mac ;;
+  MINGW* | MSYS* | CYGWIN*) OS=windows ;;
+  *) OS=other ;;
+esac
+
 GOOGLE_MCP_DIR="${GOOGLE_MCP_DIR:-$HOME/.google-mcp}"
 CREDENTIALS_PATH="$GOOGLE_MCP_DIR/credentials.json"
 ACCOUNTS_PATH="$GOOGLE_MCP_DIR/accounts.json"
-CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 NAME_PATTERN='^[A-Za-z0-9_-]+$'
 
 # Projects this script creates carry this label, so a re-run finds and reuses
@@ -36,6 +42,8 @@ BASE_DIR=""
 ACCOUNTS_DIR=""
 FILES_DIR=""
 SELECTED=()
+CLAUDE_EXE=""
+CLOSED_CLAUDE=0
 
 if [[ -t 1 ]]; then
   BOLD=$'\033[1m' DIM=$'\033[2m' RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' CYAN=$'\033[36m' RESET=$'\033[0m'
@@ -112,28 +120,138 @@ trim() {
   printf '%s' "$s"
 }
 
-# A path typed, pasted, or dragged in from Finder (which escapes spaces).
+# --- Platform -----------------------------------------------------------------
+# Git Bash's own commands use /c/Users/... paths; Windows programs (node,
+# gcloud, Claude) and Claude's config need C:\Users\... ones.
+
+native_path() { if [[ "$OS" == windows ]]; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+unix_path() { if [[ "$OS" == windows && -n "$1" ]]; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
+
+# A path typed, pasted, or dragged in. Finder escapes spaces; Windows wraps
+# the path in quotes and uses C:\ form.
 clean_path() {
   local p
   p=$(trim "$1")
   p="${p#\'}" p="${p%\'}" p="${p#\"}" p="${p%\"}"
-  p="${p//\\ / }"
+  if [[ "$OS" == windows ]]; then
+    [[ "$p" =~ ^[A-Za-z]:[\\/] ]] && p=$(cygpath -u "$p")
+  else
+    p="${p//\\ / }"
+  fi
   p="${p/#\~/$HOME}"
   printf '%s' "$p"
 }
 
-# A Cloud Console link, scoped to the project when we know its ID.
+open_url() {
+  link "$1"
+  if [[ "$OS" == mac ]]; then
+    open "$1" 2>/dev/null
+  else
+    # Not cmd's start: it splits URLs at "&".
+    rundll32.exe url.dll,FileProtocolHandler "$1" 2>/dev/null
+  fi
+}
+
+copy_to_clipboard() { if [[ "$OS" == mac ]]; then pbcopy; else clip.exe; fi; }
+
+file_mtime() { if [[ "$OS" == mac ]]; then stat -f '%Sm' "$1"; else date -r "$1" '+%b %e %H:%M:%S %Y'; fi; }
+
+# Windows can move Downloads and Desktop (e.g. into OneDrive), so ask it.
+DOWNLOADS_DIR="$HOME/Downloads"
+DESKTOP_DIR="$HOME/Desktop"
+if [[ "$OS" == windows ]]; then
+  _folders=$(powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Path; [Environment]::GetFolderPath('Desktop')" 2>/dev/null | tr -d '\r')
+  _downloads=$(sed -n 1p <<<"$_folders")
+  _desktop=$(sed -n 2p <<<"$_folders")
+  [[ -n "$_downloads" ]] && DOWNLOADS_DIR=$(cygpath -u "$_downloads")
+  [[ -n "$_desktop" ]] && DESKTOP_DIR=$(cygpath -u "$_desktop")
+fi
+
+# The Microsoft Store build of Claude keeps its config in its package folder
+# once it has written one there; the regular installer uses %APPDATA%.
+claude_config_path() {
+  if [[ "$OS" == mac ]]; then
+    printf '%s' "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+    return
+  fi
+  local f
+  for f in "$(unix_path "$LOCALAPPDATA")"/Packages/Claude_*/LocalCache/Roaming/Claude/claude_desktop_config.json; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return; }
+  done
+  printf '%s' "$(unix_path "$APPDATA")/Claude/claude_desktop_config.json"
+}
+CLAUDE_CONFIG=$(claude_config_path)
+
+claude_installed() {
+  if [[ "$OS" == mac ]]; then
+    [[ -d /Applications/Claude.app || -d "$HOME/Applications/Claude.app" ]]
+  else
+    local packages=("$(unix_path "$LOCALAPPDATA")"/Packages/Claude_*)
+    [[ -d "$(unix_path "$LOCALAPPDATA")/AnthropicClaude" || -d "${packages[0]}" ]] || claude_running
+  fi
+}
+
+claude_running() {
+  if [[ "$OS" == mac ]]; then
+    pgrep -x Claude >/dev/null
+  else
+    tasklist.exe //FI "IMAGENAME eq claude.exe" //NH 2>/dev/null | grep -qi 'claude\.exe'
+  fi
+}
+
+quit_claude() {
+  claude_running || return 0
+  if [[ "$OS" == mac ]]; then
+    osascript -e 'quit app "Claude"' 2>/dev/null
+  else
+    # Remember where it runs from, to reopen the same install.
+    CLAUDE_EXE=$(powershell.exe -NoProfile -Command '(Get-Process claude -ErrorAction SilentlyContinue | Where-Object Path | Select-Object -First 1).Path' 2>/dev/null | tr -d '\r')
+    taskkill.exe //IM claude.exe //F >/dev/null 2>&1
+  fi
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    claude_running || break
+    sleep 1
+  done
+}
+
+start_claude() {
+  if [[ "$OS" == mac ]]; then
+    open -a Claude && ok "Claude Desktop is open."
+    return
+  fi
+  local exe="$CLAUDE_EXE"
+  [[ -n "$exe" ]] || exe="$LOCALAPPDATA\\AnthropicClaude\\claude.exe"
+  if powershell.exe -NoProfile -Command "Start-Process -FilePath '$exe'" >/dev/null 2>&1; then
+    ok "Claude Desktop is open."
+  else
+    warn "Couldn't open Claude Desktop. Open it from the Start menu."
+  fi
+}
+
+restart_claude() {
+  quit_claude
+  start_claude
+}
+
+if [[ "$OS" == mac ]]; then
+  QUIT_CLAUDE_HINT="Quit Claude with Cmd+Q (not just closing the window)"
+else
+  QUIT_CLAUDE_HINT="Quit Claude from its icon in the system tray (right-click > Quit, not just closing the window)"
+fi
+
+# The first item's <field> from a JSON array on stdin (gcloud --format=json).
+json_first() {
+  node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => { try { const v = JSON.parse(s)[0]; if (v && v[process.argv[1]]) console.log(v[process.argv[1]]); } catch {} });' "$1"
+}
+
+# A Console link, scoped to the project when we know its ID.
 console_url() {
   local url="https://console.cloud.google.com/$1"
   if [[ -n "$PROJECT_ID" ]]; then
     [[ "$url" == *\?* ]] && url="$url&project=$PROJECT_ID" || url="$url?project=$PROJECT_ID"
   fi
   printf '%s' "$url"
-}
-
-open_url() {
-  link "$1"
-  open "$1" 2>/dev/null
 }
 
 timestamp() { date +%Y%m%d-%H%M%S; }
@@ -157,8 +275,12 @@ check_github_ssh() {
 check_assumptions() {
   banner "Before we start"
 
-  if [[ "$(uname)" != "Darwin" ]]; then
-    err "This script only works on macOS (it sets up Claude Desktop's Mac config). Nothing was changed."
+  if [[ "$OS" == other ]]; then
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      err "This is WSL. Run it in Git Bash instead (it comes with Git for Windows), so Claude can use it. Nothing was changed."
+    else
+      err "This script works on macOS, and on Windows in Git Bash. Nothing was changed."
+    fi
     exit 1
   fi
 
@@ -170,7 +292,11 @@ check_assumptions() {
     fi
   done
   if [[ "$missing" == 1 ]]; then
-    say "Install Node.js 20 or newer (it includes npm) from https://nodejs.org, and git with: xcode-select --install"
+    if [[ "$OS" == mac ]]; then
+      say "Install Node.js 20 or newer (it includes npm) from https://nodejs.org, and git with: xcode-select --install"
+    else
+      say "Install Node.js 20 or newer (it includes npm) from https://nodejs.org, then open a new Git Bash window."
+    fi
     exit 1
   fi
   if (($(node -p 'process.versions.node.split(".")[0]') < 20)); then
@@ -181,7 +307,7 @@ check_assumptions() {
 
   say "Checking that you can clone from GitHub over SSH..."
   until check_github_ssh; do
-    err "GitHub SSH isn't working on this Mac yet (git@github.com didn't accept your key)."
+    err "GitHub SSH isn't working on this computer yet (git@github.com didn't accept your key)."
     say "Set it up with GitHub's guide:"
     link "https://docs.github.com/en/authentication/connecting-to-github-with-ssh"
     say ""
@@ -190,10 +316,10 @@ check_assumptions() {
   done
   ok "GitHub SSH works."
 
-  if [[ -d /Applications/Claude.app || -d "$HOME/Applications/Claude.app" ]]; then
+  if claude_installed; then
     ok "Claude Desktop is installed."
   else
-    warn "Couldn't find Claude.app in Applications."
+    warn "Couldn't find Claude Desktop."
   fi
   say ""
   confirm_or_quit "Is Claude Desktop downloaded and are you signed in to it?"
@@ -205,20 +331,21 @@ check_assumptions() {
 
 # 0 = a Desktop app client, 2 = a Web application client, 1 = not a client file.
 check_client_json() {
-  node -e 'try { const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); process.exit(j.installed ? 0 : j.web ? 2 : 1); } catch { process.exit(1); }' "$1"
+  node -e 'try { const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8").replace(/^\uFEFF/, "")); process.exit(j.installed ? 0 : j.web ? 2 : 1); } catch { process.exit(1); }' \
+    "$(native_path "$1")"
 }
 
 has_credentials() { [[ -f "$CREDENTIALS_PATH" ]] && check_client_json "$CREDENTIALS_PATH"; }
 
 # The project the installed OAuth client belongs to.
 credentials_project_id() {
-  node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).installed.project_id || ""); } catch {}' \
-    "$CREDENTIALS_PATH"
+  node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8").replace(/^\uFEFF/, "")).installed.project_id || ""); } catch {}' \
+    "$(native_path "$CREDENTIALS_PATH")" | tr -d '\r'
 }
 
 # Newest Google OAuth client download in Downloads or Desktop.
 find_client_json() {
-  ls -t "$HOME/Downloads"/client_secret_*.json "$HOME/Desktop"/client_secret_*.json 2>/dev/null | head -1
+  ls -t "$DOWNLOADS_DIR"/client_secret_*.json "$DESKTOP_DIR"/client_secret_*.json 2>/dev/null | head -1
 }
 
 # Finds the downloaded client JSON (waiting for it if needed) and moves it to
@@ -248,7 +375,7 @@ install_credentials() {
       done
     fi
     if [[ -n "$src" ]]; then
-      say "Found: ${BOLD}$src${RESET}  ${DIM}(downloaded $(stat -f '%Sm' "$src"))${RESET}"
+      say "Found: ${BOLD}$src${RESET}  ${DIM}(downloaded $(file_mtime "$src"))${RESET}"
       yes_key "Use this file?" || src=""
     fi
     if [[ -z "$src" ]]; then
@@ -281,7 +408,8 @@ install_credentials() {
 
 # --- gcloud CLI ---------------------------------------------------------------
 
-# A Python new enough for gcloud (3.10+), or nothing.
+# A Python new enough for gcloud (3.10+), or nothing. Only needed on a Mac;
+# the Windows download bundles its own.
 find_python() {
   local py
   for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
@@ -296,10 +424,20 @@ find_python() {
 
 gcloud_works() { [[ -n "$GCLOUD" ]] && "$GCLOUD" --version >/dev/null 2>&1; }
 
+# On Windows, gcloud.cmd: the bin/gcloud shell script there can't find the
+# bundled Python.
 find_gcloud() {
-  local candidate
-  for candidate in "$(command -v gcloud)" "$GCLOUD_SDK_DIR/bin/gcloud" /opt/homebrew/bin/gcloud /usr/local/bin/gcloud; do
-    [[ -n "$candidate" && -x "$candidate" ]] || continue
+  local candidate candidates
+  if [[ "$OS" == mac ]]; then
+    candidates=("$(command -v gcloud)" "$GCLOUD_SDK_DIR/bin/gcloud" /opt/homebrew/bin/gcloud /usr/local/bin/gcloud)
+  else
+    candidates=("$(command -v gcloud.cmd)" "$GCLOUD_SDK_DIR/bin/gcloud.cmd"
+      "$(unix_path "$LOCALAPPDATA")/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd"
+      "/c/Program Files (x86)/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd"
+      "/c/Program Files/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.cmd")
+  fi
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
     GCLOUD="$candidate"
     gcloud_works && return 0
   done
@@ -307,30 +445,40 @@ find_gcloud() {
   return 1
 }
 
-# Google's tarball, unpacked to ~/google-cloud-sdk. Its install.sh isn't run,
-# so no shell config files are touched.
+# Google's download, unpacked to ~/google-cloud-sdk. Its installer isn't run,
+# so no shell config, PATH or system settings are touched.
 download_gcloud() {
-  local arch url tmp
+  local url tmp
   if [[ -e "$GCLOUD_SDK_DIR" ]]; then
     err "$GCLOUD_SDK_DIR exists but its gcloud doesn't run, so I'm leaving it alone."
     return 1
   fi
-  [[ "$(uname -m)" == "arm64" ]] && arch=arm || arch=x86_64
-  url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-$arch.tar.gz"
   tmp=$(mktemp -d)
-  say "Downloading the gcloud CLI (about 55 MB) into $GCLOUD_SDK_DIR..."
-  if curl -fL --progress-bar "$url" | tar -xzf - -C "$tmp" && mv "$tmp/google-cloud-sdk" "$GCLOUD_SDK_DIR"; then
-    rm -rf "$tmp"
-    GCLOUD="$GCLOUD_SDK_DIR/bin/gcloud"
+  if [[ "$OS" == mac ]]; then
+    local arch
+    [[ "$(uname -m)" == "arm64" ]] && arch=arm || arch=x86_64
+    url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-darwin-$arch.tar.gz"
+    say "Downloading the gcloud CLI (about 55 MB) into $GCLOUD_SDK_DIR..."
+    curl -fL --progress-bar "$url" | tar -xzf - -C "$tmp"
   else
-    rm -rf "$tmp"
-    err "The download didn't work."
-    return 1
+    url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-windows-x86_64-bundled-python.zip"
+    say "Downloading the gcloud CLI (about 100 MB, with its own Python) into $GCLOUD_SDK_DIR..."
+    # Windows' own tar.exe unpacks zips; Git Bash's tar doesn't.
+    curl -fL --progress-bar -o "$tmp/gcloud.zip" "$url" &&
+      say "Unpacking..." &&
+      /c/Windows/System32/tar.exe -xf "$(native_path "$tmp/gcloud.zip")" -C "$(native_path "$tmp")"
   fi
+  if [[ $? == 0 ]] && mv "$tmp/google-cloud-sdk" "$GCLOUD_SDK_DIR"; then
+    rm -rf "$tmp"
+    return 0
+  fi
+  rm -rf "$tmp"
+  err "The download didn't work."
+  return 1
 }
 
-# Uses gcloud if it's already here, otherwise installs it (Homebrew if you
-# have it, else Google's download).
+# Uses gcloud if it's already here, otherwise installs it (on a Mac, with
+# Homebrew if you have it, else Google's download).
 ensure_gcloud() {
   if find_gcloud; then
     ok "Using the gcloud CLI at $GCLOUD."
@@ -338,20 +486,23 @@ ensure_gcloud() {
   fi
 
   local python
-  python=$(find_python)
-  if command -v brew >/dev/null; then
+  if [[ "$OS" == mac ]] && command -v brew >/dev/null; then
     say "I'll install Google's gcloud CLI with Homebrew and use it to create the project and turn on the APIs for you."
     yes_key "Install it now?" || return 1
     brew install --cask gcloud-cli || { err "Homebrew couldn't install gcloud."; return 1; }
-  elif [[ -n "$python" ]]; then
-    export CLOUDSDK_PYTHON="$python"
+  else
+    if [[ "$OS" == mac ]]; then
+      python=$(find_python)
+      if [[ -z "$python" ]]; then
+        warn "gcloud needs Python 3.10 or newer (or Homebrew to install it), and this Mac has neither."
+        return 1
+      fi
+      export CLOUDSDK_PYTHON="$python"
+    fi
     say "I'll download Google's gcloud CLI and use it to create the project and turn on the APIs for you."
-    say "It goes in $GCLOUD_SDK_DIR and doesn't change any of your shell settings."
+    say "It goes in $GCLOUD_SDK_DIR and doesn't change any of your settings."
     yes_key "Download it now?" || return 1
     download_gcloud || return 1
-  else
-    warn "gcloud needs Python 3.10 or newer (or Homebrew to install it), and this Mac has neither."
-    return 1
   fi
 
   if find_gcloud; then
@@ -364,7 +515,7 @@ ensure_gcloud() {
 
 g() { "$GCLOUD" --quiet "$@"; }
 
-gcloud_active_account() { g auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1; }
+gcloud_active_account() { g auth list --filter=status:ACTIVE --format=json 2>/dev/null | json_first account | tr -d '\r'; }
 
 gcloud_login() {
   local account
@@ -384,14 +535,14 @@ gcloud_login() {
 # Reuses the project an earlier run created, or creates one.
 gcloud_project() {
   local id
-  id=$(g projects list --filter="labels.$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE" --format='value(projectId)' 2>/dev/null | head -1)
+  id=$(g projects list --filter="labels.$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE" --format=json 2>/dev/null | json_first projectId | tr -d '\r')
   if [[ -n "$id" ]]; then
     PROJECT_ID="$id"
     ok "Reusing your project $id (created by an earlier run)."
     return 0
   fi
   id="google-mcp-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
-  until g projects create "$id" --name="Google MCP" --labels="$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE"; do
+  until g projects create "$id" --name=google-mcp --labels="$PROJECT_LABEL_KEY=$PROJECT_LABEL_VALUE"; do
     warn "Google didn't create the project. A new Google Cloud account first has to accept the Terms of Service."
     open_url "https://console.cloud.google.com/"
     say "Accept the terms on that page if it asks, then come back."
@@ -585,12 +736,25 @@ npm_install() {
 
 repos_accounts_step() {
   step "1 of 5" "Get google-mcp-accounts"
+  # Windows won't let npm replace files a running server has open, so Claude
+  # (which runs the servers) has to be closed first.
+  if [[ "$OS" == windows ]] && claude_running; then
+    say "Claude Desktop is running. It has to be closed while the servers install, or Windows blocks the update."
+    if yes_key "Close Claude Desktop now? (It reopens at the end.)"; then
+      quit_claude
+      CLOSED_CLAUDE=1
+      ok "Closed Claude Desktop."
+    else
+      warn "Leaving it open. If an install fails with EBUSY or EPERM, close Claude and run this again."
+    fi
+  fi
+
   if [[ -n "$ACCOUNTS_DIR" ]]; then
     ok "You're running this from $ACCOUNTS_DIR, so the servers go next to it in $BASE_DIR."
   else
     # Default to wherever an earlier run put the repos.
     local dir default
-    default=$(claude_config existing-base)
+    default=$(unix_path "$(claude_config existing-base)")
     [[ -n "$default" ]] || default="$HOME/google-mcp"
     say "Where should the repos go? Press Enter for the default."
     read -r -p "Folder [$default]: " dir || input_ended
@@ -639,7 +803,7 @@ auth() { (cd "$ACCOUNTS_DIR" && node auth.js "$@"); }
 
 account_count() {
   node -e 'try { console.log(Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))).length); } catch { console.log(0); }' \
-    "$ACCOUNTS_PATH"
+    "$(native_path "$ACCOUNTS_PATH")" | tr -d '\r'
 }
 
 # The address an alias or nickname is connected to, or nothing.
@@ -652,7 +816,7 @@ account_email() {
         ? name
         : Object.keys(accounts).find((a) => (accounts[a].nicknames || []).includes(name));
       if (alias) console.log(accounts[alias].email);
-    } catch {}' "$ACCOUNTS_PATH" "$1"
+    } catch {}' "$(native_path "$ACCOUNTS_PATH")" "$1" | tr -d '\r'
 }
 
 add_nicknames() {
@@ -799,13 +963,24 @@ repos_review_step() {
   pause
 }
 
+# The node binary Claude should launch. On Windows, the full node.exe path.
+node_bin() {
+  local bin
+  bin=$(command -v node)
+  [[ "$OS" == windows && -f "$bin.exe" ]] && bin="$bin.exe"
+  native_path "$bin"
+}
+
 # Claude Desktop config helper. Modes:
 #   print          the mcpServers entries for the selected servers, as JSON
 #   write          merge them into Claude's config (exits 3 if nothing changed)
 #   existing-base  the folder an earlier run put the servers in
 #   existing-files the shared files folder an earlier run set
 claude_config() {
-  node - "$1" "$CLAUDE_CONFIG" "$(command -v node)" "$BASE_DIR" "$FILES_DIR" "${SELECTED[@]}" <<'EOF'
+  local base="" files=""
+  [[ -n "$BASE_DIR" ]] && base=$(native_path "$BASE_DIR")
+  [[ -n "$FILES_DIR" ]] && files=$(native_path "$FILES_DIR")
+  node - "$1" "$(native_path "$CLAUDE_CONFIG")" "$(node_bin)" "$base" "$files" "${SELECTED[@]}" <<'EOF' | tr -d '\r'
 const fs = require("fs");
 const path = require("path");
 const [mode, configPath, nodeBin, baseDir, filesDir, ...repos] = process.argv.slice(2);
@@ -819,7 +994,8 @@ const SERVERS = {
 let raw = "";
 let config = {};
 if (fs.existsSync(configPath)) {
-  raw = fs.readFileSync(configPath, "utf8");
+  // Windows editors sometimes save a byte-order mark JSON.parse rejects.
+  raw = fs.readFileSync(configPath, "utf8").replace(/^\uFEFF/, "");
   try {
     config = raw.trim() ? JSON.parse(raw) : {};
   } catch {
@@ -877,24 +1053,13 @@ fs.writeFileSync(tmp, updated);
 fs.renameSync(tmp, configPath);
 console.log(`Added ${Object.keys(entries).join(", ")} to ${configPath}`);
 EOF
-}
-
-restart_claude() {
-  if pgrep -x Claude >/dev/null; then
-    osascript -e 'quit app "Claude"' 2>/dev/null
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-      pgrep -x Claude >/dev/null || break
-      sleep 1
-    done
-  fi
-  open -a Claude && ok "Claude Desktop restarted."
+  return "${PIPESTATUS[0]}"
 }
 
 claude_prompt() {
   cat <<EOF
 Add these MCP servers to my Claude Desktop config at
-~/Library/Application Support/Claude/claude_desktop_config.json.
+$(native_path "$CLAUDE_CONFIG")
 
 - Back up the file first.
 - Merge these entries into the existing "mcpServers" object. Keep every server
@@ -902,9 +1067,9 @@ Add these MCP servers to my Claude Desktop config at
   "command" and "args" and merge its "env", keeping any other settings on it.
 - If the file doesn't exist, create it with just this content.
 - Make sure the result is valid JSON.
-- Create the folder $FILES_DIR if it doesn't exist.
+- Create the folder $(native_path "$FILES_DIR") if it doesn't exist.
 
-When you're done, tell me to fully quit Claude Desktop (Cmd+Q) and reopen it.
+When you're done, tell me to fully quit Claude Desktop and reopen it.
 
 $(claude_config print)
 EOF
@@ -918,8 +1083,8 @@ repos_claude_step() {
   fi
 
   local dir default
-  default=$(claude_config existing-files)
-  [[ -n "$default" ]] || default="$HOME/Downloads/google-mcp-files"
+  default=$(unix_path "$(claude_config existing-files)")
+  [[ -n "$default" ]] || default="$DOWNLOADS_DIR/google-mcp-files"
   say "The Gmail, Drive and Docs/Sheets/Slides servers share one folder for files they download or attach."
   read -r -p "Files folder [$default]: " dir || input_ended
   FILES_DIR=$(clean_path "${dir:-$default}")
@@ -949,8 +1114,9 @@ repos_claude_step() {
         if yes_key "Claude needs a full restart to load them. Quit and reopen Claude Desktop now?"; then
           restart_claude
         else
-          say "Quit Claude with Cmd+Q (not just closing the window) and reopen it when you're ready."
+          say "$QUIT_CLAUDE_HINT and reopen it when you're ready."
         fi
+        CLOSED_CLAUDE=0 # answered here, so it isn't reopened again at the end
         ;;
       3) ;;
       *) return 1 ;;
@@ -959,11 +1125,11 @@ repos_claude_step() {
     local prompt
     prompt=$(claude_prompt)
     say ""
-    say "${BOLD}Paste this into Claude Code (or any Claude that can edit files on this Mac):${RESET}"
+    say "${BOLD}Paste this into Claude Code (or any Claude that can edit files on this computer):${RESET}"
     say "────────────────────────────────────────────────────────────────"
     say "$prompt"
     say "────────────────────────────────────────────────────────────────"
-    printf '%s' "$prompt" | pbcopy && ok "It's also on your clipboard."
+    printf '%s' "$prompt" | copy_to_clipboard && ok "It's also on your clipboard."
   fi
 
   say ""
@@ -998,9 +1164,14 @@ main() {
   section_google
   section_repos
 
+  # Claude was closed for the install in section 2, and nothing reopened it.
+  if [[ "$CLOSED_CLAUDE" == 1 ]] && ! claude_running; then
+    start_claude
+  fi
+
   banner "All done"
   say "Heads up: while your Google app is in Testing mode, Google expires sign-ins after 7 days."
-  say "When a server reports invalid_grant, re-connect that account:"
+  say "When that happens, run refresh-tokens-mac.sh, or re-connect one account with:"
   say "  ${BOLD}cd \"${ACCOUNTS_DIR:-path/to/$ACCOUNTS_REPO}\" && node auth.js <alias>${RESET}"
   say ""
 }

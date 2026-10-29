@@ -164,10 +164,10 @@ main() {
 
   banner "Refresh Google sign-ins"
 
-  command -v node >/dev/null || { err "Node.js isn't installed. Run setup-mac.sh first."; exit 1; }
+  command -v node >/dev/null || { err "Node.js isn't installed. Run setup.sh first."; exit 1; }
   find_accounts_dir
   if [[ ! -f "$CREDENTIALS_PATH" || ! -f "$ACCOUNTS_PATH" ]]; then
-    err "Nothing is set up yet (no $CREDENTIALS_PATH or $ACCOUNTS_PATH). Run setup-mac.sh first."
+    err "Nothing is set up yet (no $CREDENTIALS_PATH or $ACCOUNTS_PATH). Run setup.sh first."
     exit 1
   fi
   if [[ ! -d "$ACCOUNTS_DIR/node_modules" ]]; then
@@ -179,7 +179,7 @@ main() {
   local checked
   checked=$(check_accounts) || { err "Couldn't check the accounts (see the error above)."; exit 1; }
   if [[ -z "$checked" ]]; then
-    warn "No Google accounts are connected. Run setup-mac.sh to connect some."
+    warn "No Google accounts are connected. Run setup.sh to connect some."
     exit 0
   fi
 
