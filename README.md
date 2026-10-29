@@ -122,7 +122,7 @@ connect, and all four servers, share it. You only do steps 1-5 once.
    "hasn't verified this app". Click **Continue** (on some screens it's under
    **Advanced**). Note that in Testing mode Google expires refresh tokens
    after 7 days, so you'll re-run `node auth.js <alias>` about weekly, or
-   `./refresh-tokens-mac.sh` to do every account that needs it (see
+   `./refresh-tokens.sh` to do every account that needs it (see
    [Refreshing expired sign-ins](#refreshing-expired-sign-ins)).
 
 5. **Create the OAuth client.** Go to **Clients** (or **APIs & Services →
@@ -262,20 +262,21 @@ do this so they never touch your real tokens).
 
 ### Refreshing expired sign-ins
 
-On macOS, `refresh-tokens-mac.sh` checks every account with Google and signs
-in again only the ones that have expired or will within 24 hours, keeping
-their aliases, nicknames, settings, and `drive.readonly`. Then it offers to
-restart Claude Desktop, which keeps using the old tokens until it restarts.
+`refresh-tokens.sh` (macOS, or Windows in Git Bash) checks every account with
+Google and signs in again only the ones that have expired or will within 24
+hours, keeping their aliases, nicknames, settings, and `drive.readonly`. Then
+it offers to restart Claude Desktop, which keeps using the old tokens until it
+restarts.
 
 ```bash
-./refresh-tokens-mac.sh         # expired or expiring accounts
-./refresh-tokens-mac.sh --all   # every account
+./refresh-tokens.sh         # expired or expiring accounts
+./refresh-tokens.sh --all   # every account
 ```
 
 Without cloning:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/refresh-tokens-mac.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/refresh-tokens.sh)
 ```
 
 ## Security notes

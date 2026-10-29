@@ -1171,7 +1171,7 @@ main() {
 
   banner "All done"
   say "Heads up: while your Google app is in Testing mode, Google expires sign-ins after 7 days."
-  say "When that happens, run refresh-tokens-mac.sh, or re-connect one account with:"
+  say "When that happens, run refresh-tokens.sh, or re-connect one account with:"
   say "  ${BOLD}cd \"${ACCOUNTS_DIR:-path/to/$ACCOUNTS_REPO}\" && node auth.js <alias>${RESET}"
   say ""
 }

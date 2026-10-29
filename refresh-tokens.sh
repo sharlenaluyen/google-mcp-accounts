@@ -7,15 +7,22 @@
 # expired, or will soon, are signed in again. Aliases, nicknames, settings and
 # drive.readonly access are kept.
 #
-# Run from a clone:   ./refresh-tokens-mac.sh         (expired or expiring accounts)
-#                     ./refresh-tokens-mac.sh --all   (every account)
-# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/refresh-tokens-mac.sh)
+# Runs on macOS, and on Windows in Git Bash (installed with Git for Windows).
+#
+# Run from a clone:   ./refresh-tokens.sh         (expired or expiring accounts)
+#                     ./refresh-tokens.sh --all   (every account)
+# Or without one:     bash <(curl -fsSL https://raw.githubusercontent.com/sharlenaluyen/google-mcp-accounts/main/refresh-tokens.sh)
+
+case "$(uname -s)" in
+  Darwin) OS=mac ;;
+  MINGW* | MSYS* | CYGWIN*) OS=windows ;;
+  *) OS=other ;;
+esac
 
 ACCOUNTS_REPO="google-mcp-accounts"
 GOOGLE_MCP_DIR="${GOOGLE_MCP_DIR:-$HOME/.google-mcp}"
 ACCOUNTS_PATH="$GOOGLE_MCP_DIR/accounts.json"
 CREDENTIALS_PATH="$GOOGLE_MCP_DIR/credentials.json"
-CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 TOKEN_DAYS=7   # how long Google keeps a Testing-mode sign-in
 SOON_HOURS=24 # refresh when it ends within this many hours
 
@@ -75,6 +82,49 @@ trim() {
   printf '%s' "$s"
 }
 
+# --- Platform -----------------------------------------------------------------
+# Git Bash's own commands use /c/Users/... paths; Windows programs (node,
+# Claude) and Claude's config use C:\Users\... ones.
+
+native_path() { if [[ "$OS" == windows ]]; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+unix_path() { if [[ "$OS" == windows && -n "$1" ]]; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
+
+# A path typed, pasted, or dragged in. Finder escapes spaces; Windows wraps
+# the path in quotes and uses C:\ form.
+clean_path() {
+  local p
+  p=$(trim "$1")
+  p="${p#\'}" p="${p%\'}" p="${p#\"}" p="${p%\"}"
+  if [[ "$OS" == windows ]]; then
+    [[ "$p" =~ ^[A-Za-z]:[\\/] ]] && p=$(cygpath -u "$p")
+  else
+    p="${p//\\ / }"
+  fi
+  p="${p/#\~/$HOME}"
+  printf '%s' "$p"
+}
+
+# The Microsoft Store build of Claude keeps its config in its package folder
+# once it has written one there; the regular installer uses %APPDATA%.
+claude_config_path() {
+  if [[ "$OS" == mac ]]; then
+    printf '%s' "$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+    return
+  fi
+  local f
+  for f in "$(unix_path "$LOCALAPPDATA")"/Packages/Claude_*/LocalCache/Roaming/Claude/claude_desktop_config.json; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return; }
+  done
+  printf '%s' "$(unix_path "$APPDATA")/Claude/claude_desktop_config.json"
+}
+CLAUDE_CONFIG=$(claude_config_path)
+
+if [[ "$OS" == mac ]]; then
+  QUIT_CLAUDE_HINT="Quit Claude with Cmd+Q (not just closing the window)"
+else
+  QUIT_CLAUDE_HINT="Quit Claude from its icon in the system tray (right-click > Quit, not just closing the window)"
+fi
+
 # --- Finding things -----------------------------------------------------------
 
 is_accounts_dir() { [[ -f "$1/auth.js" && -f "$1/store.js" ]]; }
@@ -95,16 +145,15 @@ find_accounts_dir() {
         .map((key) => servers[key])
         .find((e) => e?.args?.[0]);
       if (entry) console.log(path.resolve(entry.args[0], "../../..", process.argv[2]));
-    } catch {}' "$CLAUDE_CONFIG" "$ACCOUNTS_REPO")
+    } catch {}' "$(native_path "$CLAUDE_CONFIG")" "$ACCOUNTS_REPO" | tr -d '\r')
+  dir=$(unix_path "$dir")
   is_accounts_dir "$dir" && { ACCOUNTS_DIR="$dir"; return; }
   dir="$HOME/google-mcp/$ACCOUNTS_REPO"
   is_accounts_dir "$dir" && { ACCOUNTS_DIR="$dir"; return; }
 
   while true; do
     read -r -p "Where is your $ACCOUNTS_REPO folder? (drag it here): " dir || input_ended
-    dir=$(trim "$dir")
-    dir="${dir//\\ / }"
-    dir="${dir/#\~/$HOME}"
+    dir=$(clean_path "$dir")
     is_accounts_dir "$dir" && { ACCOUNTS_DIR=$(cd "$dir" && pwd); return; }
     err "That folder doesn't have auth.js in it."
   done
@@ -143,17 +192,40 @@ EOF
 
 account_email() {
   node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]].email); } catch {}' \
-    "$ACCOUNTS_PATH" "$1"
+    "$(native_path "$ACCOUNTS_PATH")" "$1" | tr -d '\r'
+}
+
+claude_running() {
+  if [[ "$OS" == mac ]]; then
+    pgrep -x Claude >/dev/null
+  else
+    tasklist.exe //FI "IMAGENAME eq claude.exe" //NH 2>/dev/null | grep -qi 'claude\.exe'
+  fi
 }
 
 restart_claude() {
-  osascript -e 'quit app "Claude"' 2>/dev/null
-  local i
+  local exe="" i
+  if [[ "$OS" == mac ]]; then
+    osascript -e 'quit app "Claude"' 2>/dev/null
+  else
+    # Remember where it runs from, to reopen the same install.
+    exe=$(powershell.exe -NoProfile -Command '(Get-Process claude -ErrorAction SilentlyContinue | Where-Object Path | Select-Object -First 1).Path' 2>/dev/null | tr -d '\r')
+    taskkill.exe //IM claude.exe //F >/dev/null 2>&1
+  fi
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-    pgrep -x Claude >/dev/null || break
+    claude_running || break
     sleep 1
   done
-  open -a Claude && ok "Claude Desktop restarted."
+  if [[ "$OS" == mac ]]; then
+    open -a Claude && ok "Claude Desktop restarted."
+    return
+  fi
+  [[ -n "$exe" ]] || exe="$LOCALAPPDATA\\AnthropicClaude\\claude.exe"
+  if powershell.exe -NoProfile -Command "Start-Process -FilePath '$exe'" >/dev/null 2>&1; then
+    ok "Claude Desktop restarted."
+  else
+    warn "Closed Claude Desktop, but couldn't reopen it. Open it from the Start menu."
+  fi
 }
 
 # --- Main ---------------------------------------------------------------------
@@ -163,6 +235,11 @@ main() {
   [[ -t 0 ]] || exec </dev/tty
 
   banner "Refresh Google sign-ins"
+
+  if [[ "$OS" == other ]]; then
+    err "This works on macOS, and on Windows in Git Bash (not WSL). Nothing was changed."
+    exit 1
+  fi
 
   command -v node >/dev/null || { err "Node.js isn't installed. Run setup.sh first."; exit 1; }
   find_accounts_dir
@@ -218,7 +295,7 @@ main() {
 
   if [[ ${#aliases[@]} == 0 ]]; then
     ok "Nothing to refresh."
-    say "${DIM}To sign every account in again anyway: ./refresh-tokens-mac.sh --all${RESET}"
+    say "${DIM}To sign every account in again anyway: ./refresh-tokens.sh --all${RESET}"
     exit 0
   fi
 
@@ -256,12 +333,12 @@ main() {
 
   banner "Done"
   ok "Refreshed $refreshed of ${#aliases[@]}."
-  if ((refreshed > 0)) && pgrep -x Claude >/dev/null; then
+  if ((refreshed > 0)) && claude_running; then
     say ""
     if yes_key "Claude Desktop keeps using the old sign-ins until it restarts. Quit and reopen it now?"; then
       restart_claude
     else
-      say "Quit Claude with Cmd+Q (not just closing the window) and reopen it when you're ready."
+      say "$QUIT_CLAUDE_HINT and reopen it when you're ready."
     fi
   fi
 }
