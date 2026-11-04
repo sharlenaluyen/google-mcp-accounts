@@ -5,6 +5,7 @@
 // Usage:
 //   node auth.js <alias>                       -> connect/re-auth one Google account under this alias
 //   node auth.js <alias> --with-drive-readonly -> same, plus read access to your whole Drive (opt-in)
+//   node auth.js <alias> --expect <email>      -> same, but only saves if you sign in as <email>
 //   node auth.js --list                        -> list connected accounts and what each one granted
 //   node auth.js --remove <alias>              -> disconnect an account
 //   node auth.js --nick <alias> <nickname>     -> add another name for an account
@@ -36,14 +37,24 @@ function parseArgs() {
   if (args[0] === "--nick") return { cmd: "nick", alias: args[1], nickname: args[2] };
   if (args[0] === "--unnick") return { cmd: "unnick", nickname: args[1] };
   if (args[0] && !args[0].startsWith("--")) {
-    return { cmd: "connect", alias: args[0], driveReadonly: args.includes("--with-drive-readonly") };
+    const expect = args.indexOf("--expect");
+    return {
+      cmd: "connect",
+      alias: args[0],
+      driveReadonly: args.includes("--with-drive-readonly"),
+      expectEmail: expect === -1 ? undefined : args[expect + 1] || "",
+    };
   }
   return { cmd: "help" };
 }
 
-async function connect(alias, driveReadonly) {
+async function connect(alias, driveReadonly, expectEmail) {
   if (!alias || !NAME_PATTERN.test(alias)) {
     console.error("Give this account a short alias, e.g.: node auth.js personal");
+    process.exit(1);
+  }
+  if (expectEmail === "" || expectEmail?.startsWith("--")) {
+    console.error("Usage: node auth.js <alias> --expect <email>");
     process.exit(1);
   }
 
@@ -64,9 +75,12 @@ async function connect(alias, driveReadonly) {
     prompt: "consent", // forces a refresh_token every time, important when re-connecting
     scope: scopes,
     state,
+    // Pre-selects that account in Google's account picker.
+    ...(expectEmail && { login_hint: expectEmail }),
   });
 
   console.log(`\nConnecting Google account as alias "${alias}".`);
+  if (expectEmail) console.log(`Sign in as ${expectEmail}; any other account is refused.`);
   console.log(`Requesting: ${scopes.map(shortScope).join(", ")}`);
   if (driveReadonly) console.log(`Includes drive.readonly: read access to every file in this Drive.`);
   console.log(`Opening your browser for Google sign-in...\n`);
@@ -83,6 +97,15 @@ async function connect(alias, driveReadonly) {
   // record what was actually granted rather than what was asked for.
   const granted = (tokens.scope || scopes.join(" ")).split(" ").filter(Boolean);
   const email = await lookupEmail(oauth2Client).catch(fail);
+  // Checked before saving, so signing in to the wrong account can't take
+  // the alias over.
+  if (expectEmail && email.toLowerCase() !== expectEmail.toLowerCase()) {
+    fail(
+      new Error(
+        `You signed in as ${email}, not ${expectEmail}. Nothing was saved; run it again and pick ${expectEmail}.`
+      )
+    );
+  }
 
   const saved = await upsertAccount(alias, {
     email,
@@ -236,6 +259,9 @@ Google MCP accounts - one login per Google account, shared by every Google MCP s
   node auth.js <alias> --with-drive-readonly
                                     same, plus read access to your whole Drive, so
                                     multi-gdrive-mcp can search files it didn't create
+  node auth.js <alias> --expect <email>
+                                    same, but only saves if you sign in as <email>
+                                    (Google pre-selects it); use when re-authorizing
   node auth.js --list               list connected accounts and what each one granted
   node auth.js --remove <alias>     disconnect an account (local token only)
   node auth.js --nick <alias> <nickname>
@@ -249,8 +275,8 @@ Example:
 `);
 }
 
-const { cmd, alias, nickname, driveReadonly } = parseArgs();
-if (cmd === "connect") await connect(alias, driveReadonly);
+const { cmd, alias, nickname, driveReadonly, expectEmail } = parseArgs();
+if (cmd === "connect") await connect(alias, driveReadonly, expectEmail);
 else if (cmd === "list") await list();
 else if (cmd === "remove") await remove(alias);
 else if (cmd === "nick") await nick(alias, nickname);

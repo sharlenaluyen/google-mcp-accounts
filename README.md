@@ -236,6 +236,7 @@ folder.
 ```
 node auth.js <alias>                        connect or re-authorize a Google account
 node auth.js <alias> --with-drive-readonly  same, plus read access to the whole Drive
+node auth.js <alias> --expect <email>       same, but refuses to save any other account
 node auth.js --list                         accounts, nicknames, and what each one granted
 node auth.js --remove <alias>               disconnect (local token only)
 node auth.js --nick <alias> <nickname>      another name for the same account
@@ -249,6 +250,11 @@ token**, keeping its nicknames and settings. Do this when:
 - you revoked the app's access at <https://myaccount.google.com/permissions>;
 - a server reports `invalid_grant` (Google expired the token; this happens
   after 7 days while the OAuth consent screen is in "Testing" mode).
+
+Re-authorizing with `--expect <email>` pre-selects that account in Google's
+picker and refuses to save if you sign in as a different one, so a wrong click
+can't move the alias to another account. `refresh-tokens.sh` and `setup.sh`
+always pass it when signing an existing alias in again.
 
 Connecting an address that's already connected under another alias doesn't
 create a duplicate. It refreshes the existing entry and adds the new name as
