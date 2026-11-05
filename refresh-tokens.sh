@@ -190,11 +190,6 @@ for (const row of rows) console.log(row);
 EOF
 }
 
-account_email() {
-  node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]].email); } catch {}' \
-    "$(native_path "$ACCOUNTS_PATH")" "$1" | tr -d '\r'
-}
-
 claude_running() {
   if [[ "$OS" == mac ]]; then
     pgrep -x Claude >/dev/null
@@ -300,21 +295,21 @@ main() {
   fi
 
   say "${BOLD}${#aliases[@]} to refresh.${RESET} For each one, your browser opens and you sign in as that account."
-  local i refreshed=0 cancelled after flags
+  local i refreshed=0 cancelled flags
   for i in "${!aliases[@]}"; do
     alias="${aliases[$i]}"
     email="${emails[$i]}"
     printf '\n%s── %s (%s)%s %s\n\n' "$BOLD" "$alias" "$email" "$RESET" "${DIM}${reasons[$i]}${RESET}"
     yes_key "Refresh it now?" || { say "Skipped $alias."; continue; }
     say "In the browser:"
-    say "  1. Pick ${BOLD}$email${RESET}. ${DIM}(A different account would take over the alias \"$alias\".)${RESET}"
+    say "  1. Pick ${BOLD}$email${RESET}. ${DIM}(Any other account is refused, and \"$alias\" stays as it is.)${RESET}"
     say "  2. On \"Google hasn't verified this app\", click ${BOLD}Continue${RESET}."
     say "  3. Leave ${BOLD}every permission ticked${RESET} and click ${BOLD}Continue${RESET}."
     say "${DIM}(Press Ctrl+C here to cancel this one.)${RESET}"
     pause "Press any key to open the browser."
 
-    flags=()
-    [[ "${drives[$i]}" == 1 ]] && flags=(--with-drive-readonly)
+    flags=(--expect "$email")
+    [[ "${drives[$i]}" == 1 ]] && flags+=(--with-drive-readonly)
     cancelled=0
     trap 'cancelled=1' INT
     (cd "$ACCOUNTS_DIR" && node auth.js "$alias" "${flags[@]}")
@@ -323,10 +318,6 @@ main() {
     if [[ "$cancelled" == 1 || "$status" != 0 ]]; then
       warn "$alias wasn't refreshed. Its old sign-in is unchanged."
       continue
-    fi
-    after=$(account_email "$alias")
-    if [[ "$after" != "$email" ]]; then
-      warn "\"$alias\" is now $after instead of $email. Run this again with --all and sign in as $email to put it back."
     fi
     refreshed=$((refreshed + 1))
   done

@@ -844,28 +844,24 @@ add_nicknames() {
 }
 
 connect_one() {
-  local alias="$1" before="$2" cancelled=0 status after
+  local alias="$1" before="$2" cancelled=0 status
   say ""
   say "Your browser will open a Google sign-in page. There:"
-  say "  1. Pick (or sign in to) the Google account you want to call ${BOLD}$alias${RESET}${before:+ (${BOLD}$before${RESET})}."
+  say "  1. Pick (or sign in to) the Google account you want to call ${BOLD}$alias${RESET}${before:+ (${BOLD}$before${RESET}; any other is refused)}."
   say "  2. On \"Google hasn't verified this app\", click ${BOLD}Continue${RESET} (sometimes under ${BOLD}Advanced${RESET})."
   say "  3. Leave ${BOLD}every permission ticked${RESET} and click ${BOLD}Continue${RESET}."
   say "  4. When the tab says \"Account connected\", come back here."
   say "${DIM}(Press Ctrl+C here to cancel this sign-in.)${RESET}"
   pause "Press any key to open the browser."
   trap 'cancelled=1' INT
-  auth "$alias"
+  # Re-signing in to a connected alias only accepts that same account.
+  auth "$alias" ${before:+--expect "$before"}
   status=$?
   trap - INT
   if [[ "$cancelled" == 1 || "$status" != 0 ]]; then
     [[ "$cancelled" == 1 ]] && warn "Sign-in cancelled." || err "That account didn't connect."
-    say "Common causes: the address isn't a test user (section 1, step 4), or you unticked a permission."
+    say "Common causes: the address isn't a test user (section 1, step 4), you unticked a permission${before:+, or you signed in as an account other than $before}."
     return 1
-  fi
-  after=$(account_email "$alias")
-  if [[ -n "$before" && "$after" != "$before" ]]; then
-    warn "\"$alias\" used to be $before and is now $after."
-    say "If that's not what you wanted, run this step again with alias $alias and sign in as $before."
   fi
 }
 
@@ -892,7 +888,7 @@ connect_accounts() {
     email=$(account_email "$alias")
     if [[ -n "$email" ]]; then
       say "\"$alias\" is already connected to ${BOLD}$email${RESET}."
-      yes_key "Sign in to it again to refresh it? (Sign in as $email; a different account would take over this alias.)" ||
+      yes_key "Sign in to it again to refresh it? (Sign in as $email; any other account is refused.)" ||
         continue
     fi
     connect_one "$alias" "$email" && add_nicknames "$alias"
